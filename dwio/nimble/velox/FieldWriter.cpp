@@ -16,10 +16,11 @@
 #include "dwio/nimble/velox/FieldWriter.h"
 #include <folly/system/HardwareConcurrency.h>
 #include "dwio/nimble/common/Exceptions.h"
-#include "dwio/nimble/common/Types.h"
 #include "dwio/nimble/velox/DeduplicationUtils.h"
+#include "dwio/nimble/velox/RawSizeUtils.h"
 #include "dwio/nimble/velox/SchemaBuilder.h"
 #include "dwio/nimble/velox/SchemaTypes.h"
+#include "dwio/nimble/velox/VectorAdapters.h"
 #include "velox/common/base/CompareFlags.h"
 #include "velox/vector/ComplexVector.h"
 #include "velox/vector/DictionaryVector.h"
@@ -78,80 +79,7 @@ struct NimbleTypeTraits<velox::TypeKind::VARBINARY> {
   static constexpr ScalarKind scalarKind = ScalarKind::Binary;
 };
 
-// Adapters to handle flat or decoded vector using same interfaces.
-template <typename T = int8_t>
-class Flat {
-  static constexpr auto kIsBool = std::is_same_v<T, bool>;
-
- public:
-  explicit Flat(const velox::VectorPtr& vector)
-      : vector_{vector}, nulls_{vector->rawNulls()} {
-    if constexpr (!kIsBool) {
-      if (auto casted = vector->asFlatVector<T>()) {
-        values_ = casted->rawValues();
-      }
-    }
-  }
-
-  bool hasNulls() const {
-    return vector_->mayHaveNulls();
-  }
-
-  bool isNullAt(velox::vector_size_t index) const {
-    return velox::bits::isBitNull(nulls_, index);
-  }
-
-  T valueAt(velox::vector_size_t index) const {
-    if constexpr (kIsBool) {
-      return static_cast<const velox::FlatVector<T>*>(vector_.get())
-          ->valueAtFast(index);
-    } else {
-      return values_[index];
-    }
-  }
-
-  velox::vector_size_t index(velox::vector_size_t index) const {
-    return index;
-  }
-
- private:
-  const velox::VectorPtr& vector_;
-  const uint64_t* nulls_;
-  const T* values_;
-};
-
-template <typename T = int8_t, bool IgnoreNulls = false>
-class Decoded {
- public:
-  explicit Decoded(const velox::DecodedVector& decoded) : decoded_{decoded} {}
-
-  bool hasNulls() const {
-    if constexpr (IgnoreNulls) {
-      return false;
-    } else {
-      return decoded_.mayHaveNulls();
-    }
-  }
-
-  bool isNullAt(velox::vector_size_t index) const {
-    if constexpr (IgnoreNulls) {
-      return false;
-    } else {
-      return decoded_.isNullAt(index);
-    }
-  }
-
-  T valueAt(velox::vector_size_t index) const {
-    return decoded_.valueAt<T>(index);
-  }
-
-  velox::vector_size_t index(velox::vector_size_t index) const {
-    return decoded_.index(index);
-  }
-
- private:
-  const velox::DecodedVector& decoded_;
-};
+constexpr uint64_t kTimestampLogicalSize = 12;
 
 template <bool addNulls, typename Vector, typename Consumer, typename IndexOp>
 uint64_t iterateNonNulls(
@@ -160,10 +88,10 @@ uint64_t iterateNonNulls(
     const Vector& vector,
     const Consumer& consumer,
     const IndexOp& indexOp) {
-  uint64_t nonNullCount = 0;
+  uint64_t nonNullCount{0};
   if (vector.hasNulls()) {
     ranges.applyEach([&](auto offset) {
-      auto notNull = !vector.isNullAt(offset);
+      const auto notNull = !vector.isNullAt(offset);
       if constexpr (addNulls) {
         nonNulls.push_back(notNull);
       }
@@ -376,7 +304,7 @@ class SimpleFieldWriter : public FieldWriter {
         auto nonNullCount = iterateNonNullValues(
             ranges,
             valuesStream_.mutableNonNulls(),
-            Flat<SourceType>{vector},
+            FlatAdapter<SourceType>{vector},
             [&](SourceType value) {
               data.push_back(
                   C::convert(value, buffer, valuesStream_.extraMemory()));
@@ -390,7 +318,7 @@ class SimpleFieldWriter : public FieldWriter {
       auto nonNullCount = iterateNonNullValues(
           ranges,
           valuesStream_.mutableNonNulls(),
-          Decoded<SourceType>{decoded},
+          DecodedAdapter<SourceType>{decoded},
           [&](SourceType value) {
             data.push_back(
                 C::convert(value, buffer, valuesStream_.extraMemory()));
@@ -424,7 +352,7 @@ class SimpleFieldWriter : public FieldWriter {
 
     auto totalNonNullCount = valuesStream_.mutableData().size();
     auto rangeStart = totalNonNullCount - batchNonNullValueCount;
-    if (statisticsCollector_->isShared()) {
+    if (statisticsCollector_->shared()) {
       // TODO(T253295607): consider using converter for stats collection.
       auto sharedBuilder =
           statisticsCollector_->as<SharedStatisticsCollector>();
@@ -512,7 +440,7 @@ class StringFieldWriter : public FieldWriter {
       nonNullCount = iterateNonNullValues(
           ranges,
           valuesStream_.mutableNonNulls(),
-          Flat<velox::StringView>{vector},
+          FlatAdapter<velox::StringView>{vector},
           appendToStringBuffer);
     } else {
       auto decodingContext = context_.decodingContext();
@@ -521,7 +449,7 @@ class StringFieldWriter : public FieldWriter {
       nonNullCount = iterateNonNullValues(
           ranges,
           valuesStream_.mutableNonNulls(),
-          Decoded<velox::StringView>{decoded},
+          DecodedAdapter<velox::StringView>{decoded},
           appendToStringBuffer);
     }
 
@@ -566,7 +494,7 @@ class StringFieldWriter : public FieldWriter {
       return;
     }
 
-    if (statisticsCollector_->isShared()) {
+    if (statisticsCollector_->shared()) {
       // TODO: looks like we can just use the same converter pattern.
       auto sharedBuilder =
           statisticsCollector_->as<SharedStatisticsCollector>();
@@ -636,7 +564,7 @@ class TimestampFieldWriter : public FieldWriter {
       nonNullCount = iterateNonNullValues(
           ranges,
           microsStream_.mutableNonNulls(),
-          Flat<velox::Timestamp>{vector},
+          FlatAdapter<velox::Timestamp>{vector},
           processTimestamp);
     } else {
       auto decodingContext = context_.decodingContext();
@@ -645,7 +573,7 @@ class TimestampFieldWriter : public FieldWriter {
       nonNullCount = iterateNonNullValues(
           ranges,
           microsStream_.mutableNonNulls(),
-          Decoded<velox::Timestamp>{decoded},
+          DecodedAdapter<velox::Timestamp>{decoded},
           processTimestamp);
     }
 
@@ -720,7 +648,7 @@ class RowFieldWriter : public FieldWriter {
         auto nonNullCount = iterateNonNullIndices<true>(
             ranges,
             nullsStream_.mutableNonNulls(),
-            Flat{vector},
+            FlatAdapter<>{vector},
             [&](auto offset) { childRanges.add(offset, 1); });
         nullCount = size - nonNullCount;
       } else {
@@ -743,12 +671,12 @@ class RowFieldWriter : public FieldWriter {
           ? iterateNonNullIndices<false>(
                 ranges,
                 nullsStream_.mutableNonNulls(),
-                Decoded<int8_t, true>{decoded},
+                DecodedAdapter<int8_t, true>{decoded},
                 [&](auto offset) { childRanges.add(offset, 1); })
           : iterateNonNullIndices<true>(
                 ranges,
                 nullsStream_.mutableNonNulls(),
-                Decoded{decoded},
+                DecodedAdapter{decoded},
                 [&](auto offset) { childRanges.add(offset, 1); });
       nullCount = size - nonNullCount;
     }
@@ -853,7 +781,10 @@ class MultiValueFieldWriter : public FieldWriter {
       lengthsStream_.ensureAdditionalNullsCapacity(
           casted->mayHaveNulls(), size);
       auto nonNullCount = iterateNonNullIndices<true>(
-          ranges, lengthsStream_.mutableNonNulls(), Flat{vector}, proc);
+          ranges,
+          lengthsStream_.mutableNonNulls(),
+          FlatAdapter<>{vector},
+          proc);
       nullCount = size - nonNullCount;
     } else {
       auto decodingContext = context_.decodingContext();
@@ -866,7 +797,10 @@ class MultiValueFieldWriter : public FieldWriter {
       lengthsStream_.ensureAdditionalNullsCapacity(
           decoded.mayHaveNulls(), size);
       auto nonNullCount = iterateNonNullIndices<true>(
-          ranges, lengthsStream_.mutableNonNulls(), Decoded{decoded}, proc);
+          ranges,
+          lengthsStream_.mutableNonNulls(),
+          DecodedAdapter<>{decoded},
+          proc);
       nullCount = size - nonNullCount;
     }
 
@@ -982,7 +916,11 @@ class SlidingWindowMapFieldWriter : public FieldWriter {
         currentOffset_(0),
         cached_{false},
         cachedLength_{0},
-        statisticsCollector_{context.getStatsCollector(type->id())} {
+        statisticsCollector_{context.getStatsCollector(type->id())},
+        keyStatisticsCollector_{
+            context.getStatsCollector(type->childAt(0)->id())},
+        valueStatisticsCollector_{
+            context.getStatsCollector(type->childAt(1)->id())} {
     NIMBLE_DCHECK_EQ(type->size(), 2, "Invalid map type.");
     keys_ = FieldWriter::create(context, type->childAt(0));
     values_ = FieldWriter::create(context, type->childAt(1));
@@ -997,11 +935,77 @@ class SlidingWindowMapFieldWriter : public FieldWriter {
       const OrderedRanges& ranges,
       folly::Executor*) override {
     OrderedRanges childFilteredRanges;
+    OrderedRanges fullChildRanges;
+    // childItemCount is the (logical) total cardinality of map elements,
+    // and is thus the total cardinality for both the key and value subcolumn.
+    uint64_t childItemCount = 0;
+    uint64_t keyNullCount = 0;
+    uint64_t valueNullCount = 0;
     auto map = ingestOffsetsAndLengthsDeduplicated(
-        vector, ranges, childFilteredRanges);
+        vector,
+        ranges,
+        childFilteredRanges,
+        fullChildRanges,
+        childItemCount,
+        keyNullCount,
+        valueNullCount);
     if (childFilteredRanges.size() > 0) {
       keys_->write(map->mapKeys(), childFilteredRanges);
       values_->write(map->mapValues(), childFilteredRanges);
+    }
+    // Adjust child stats to account for deduplicated elements.
+    // Child writers only see the deduplicated ranges, so their valueCount
+    // is the deduplicated count. We need to add the difference to get
+    // the full (non-deduplicated) valueCount. Similarly for null counts.
+    auto dedupedChildItemCount = childFilteredRanges.size();
+    if (childItemCount > dedupedChildItemCount) {
+      // Count nulls in deduplicated child elements.
+      uint64_t dedupedKeyNullCount = 0;
+      uint64_t dedupedValueNullCount = 0;
+      auto* mapKeys = map->mapKeys().get();
+      auto* mapValues = map->mapValues().get();
+      if (mapKeys->mayHaveNulls()) {
+        const auto* keyNulls = mapKeys->rawNulls();
+        if (keyNulls != nullptr) {
+          childFilteredRanges.apply([&](auto offset, auto count) {
+            dedupedKeyNullCount +=
+                velox::bits::countNulls(keyNulls, offset, offset + count);
+          });
+        }
+      }
+      if (mapValues->mayHaveNulls()) {
+        const auto* valueNulls = mapValues->rawNulls();
+        if (valueNulls != nullptr) {
+          childFilteredRanges.apply([&](auto offset, auto count) {
+            dedupedValueNullCount +=
+                velox::bits::countNulls(valueNulls, offset, offset + count);
+          });
+        }
+      }
+      auto additionalItemCount = childItemCount - dedupedChildItemCount;
+      auto additionalKeyNullCount = keyNullCount - dedupedKeyNullCount;
+      auto additionalValueNullCount = valueNullCount - dedupedValueNullCount;
+      // Calculate the raw size for the additional (duplicated) elements
+      // using getRawSizeFromVector, which handles variable-width and complex
+      // types correctly (unlike a simple typeSize * count formula).
+      RawSizeContext rawSizeContext;
+      auto keyRawSize =
+          getRawSizeFromVector(map->mapKeys(), fullChildRanges, rawSizeContext);
+      auto dedupedKeyRawSize = getRawSizeFromVector(
+          map->mapKeys(), childFilteredRanges, rawSizeContext);
+      auto additionalKeyRawSize = keyRawSize - dedupedKeyRawSize;
+      auto valueRawSize = getRawSizeFromVector(
+          map->mapValues(), fullChildRanges, rawSizeContext);
+      auto dedupedValueRawSize = getRawSizeFromVector(
+          map->mapValues(), childFilteredRanges, rawSizeContext);
+      auto additionalValueRawSize = valueRawSize - dedupedValueRawSize;
+      amendChildStatistics(
+          additionalItemCount,
+          additionalKeyNullCount,
+          additionalKeyRawSize,
+          additionalItemCount,
+          additionalValueNullCount,
+          additionalValueRawSize);
     }
   }
 
@@ -1036,6 +1040,31 @@ class SlidingWindowMapFieldWriter : public FieldWriter {
     statisticsCollector_->addLogicalSize(logicalSize);
   }
 
+  // Collects additional child element statistics for deduplicated elements.
+  // This is needed because child writers only see deduplicated ranges, so
+  // their valueCount would only reflect the deduplicated count. We need to
+  // add the difference (childItemCount- dedupedChildCount) to get the
+  // full valueCount. Similarly, we need to add the null count difference
+  // and the logical size for these additional elements.
+  void amendChildStatistics(
+      uint64_t additionalKeyItemCount,
+      uint64_t additionalKeyNullCount,
+      uint64_t additionalKeyRawSize,
+      uint64_t additionalValueItemCount,
+      uint64_t additionalValueNullCount,
+      uint64_t additionalValueRawSize) {
+    if (keyStatisticsCollector_) {
+      keyStatisticsCollector_->addCounts(
+          additionalKeyItemCount, additionalKeyNullCount);
+      keyStatisticsCollector_->addLogicalSize(additionalKeyRawSize);
+    }
+    if (valueStatisticsCollector_) {
+      valueStatisticsCollector_->addCounts(
+          additionalValueItemCount, additionalValueNullCount);
+      valueStatisticsCollector_->addLogicalSize(additionalValueRawSize);
+    }
+  }
+
   std::unique_ptr<FieldWriter> keys_;
   std::unique_ptr<FieldWriter> values_;
   NullableContentStreamData<uint32_t>& offsetsStream_;
@@ -1045,11 +1074,17 @@ class SlidingWindowMapFieldWriter : public FieldWriter {
   velox::vector_size_t cachedLength_;
   velox::VectorPtr cachedValue_;
   StatisticsCollector* statisticsCollector_;
+  StatisticsCollector* keyStatisticsCollector_;
+  StatisticsCollector* valueStatisticsCollector_;
 
   const velox::MapVector* ingestOffsetsAndLengthsDeduplicated(
       const velox::VectorPtr& vector,
       const OrderedRanges& ranges,
-      OrderedRanges& filteredRanges) {
+      OrderedRanges& filteredRanges,
+      OrderedRanges& fullChildRanges,
+      uint64_t& childItemCount,
+      uint64_t& keyNullCount,
+      uint64_t& valueNullCount) {
     const auto size = ranges.size();
     const velox::MapVector* mapVector = vector->as<velox::MapVector>();
     const velox::vector_size_t* rawOffsets;
@@ -1057,9 +1092,31 @@ class SlidingWindowMapFieldWriter : public FieldWriter {
     velox::vector_size_t lastCompareIndex = -1;
     auto& offsetsData = offsetsStream_.mutableData();
     auto& lengthsData = lengthsStream_.mutableData();
+    childItemCount = 0;
+    keyNullCount = 0;
+    valueNullCount = 0;
+
+    // Get child null pointers for null counting.
+    const uint64_t* keyNulls = nullptr;
+    const uint64_t* valueNulls = nullptr;
 
     auto processMapIndex = [&](velox::vector_size_t index) {
       auto const length = rawLengths[index];
+      // Track total child count for all map entries (including duplicates).
+      childItemCount += length;
+      // Track null counts and full child ranges for all elements.
+      if (length > 0) {
+        auto childOffset = rawOffsets[index];
+        fullChildRanges.add(childOffset, length);
+        if (keyNulls != nullptr) {
+          keyNullCount += velox::bits::countNulls(
+              keyNulls, childOffset, childOffset + length);
+        }
+        if (valueNulls != nullptr) {
+          valueNullCount += velox::bits::countNulls(
+              valueNulls, childOffset, childOffset + length);
+        }
+      }
 
       bool match = false;
       // Compare with the last element if not the first elemment
@@ -1092,12 +1149,17 @@ class SlidingWindowMapFieldWriter : public FieldWriter {
     };
 
     uint64_t nullCount = 0;
-    if (mapVector) {
+    if (mapVector != nullptr) {
       rawOffsets = mapVector->rawOffsets();
       rawLengths = mapVector->rawSizes();
+      // Initialize key/value null pointers for child null counting.
+      auto* keysVector = mapVector->mapKeys().get();
+      auto* valuesVector = mapVector->mapValues().get();
+      keyNulls = keysVector->rawNulls();
+      valueNulls = valuesVector->rawNulls();
       offsetsStream_.ensureAdditionalNullsCapacity(
           mapVector->mayHaveNulls(), size);
-      Flat iterableVector{vector};
+      FlatAdapter<> iterableVector{vector};
       auto nonNullCount = iterateNonNullIndices<true>(
           ranges,
           offsetsStream_.mutableNonNulls(),
@@ -1111,9 +1173,14 @@ class SlidingWindowMapFieldWriter : public FieldWriter {
       NIMBLE_CHECK_NOT_NULL(mapVector, "Unexpected vector type");
       rawOffsets = mapVector->rawOffsets();
       rawLengths = mapVector->rawSizes();
+      // Initialize key/value null pointers for child null counting.
+      auto* keysVector = mapVector->mapKeys().get();
+      auto* valuesVector = mapVector->mapValues().get();
+      keyNulls = keysVector->rawNulls();
+      valueNulls = valuesVector->rawNulls();
       offsetsStream_.ensureAdditionalNullsCapacity(
           decoded.mayHaveNulls(), size);
-      Decoded iterableVector{decoded};
+      DecodedAdapter<> iterableVector{decoded};
       auto nonNullCount = iterateNonNullIndices<true>(
           ranges,
           offsetsStream_.mutableNonNulls(),
@@ -1236,16 +1303,17 @@ class FlatMapValueFieldWriter {
   }
 
   // Returns whether the offset is successfully recorded.
+  //
   // NOTE: this method is always called after calling prepare(), so
   // we can access the raw in map stream data without size checks.
   bool add(velox::vector_size_t offset, uint32_t mapIndex) {
     auto& data = inMapStream_.mutableData();
-    auto index = mapIndex + data.size();
+    const auto index = mapIndex + data.size();
     // The index being already populated means we have a key duplication.
     // In order to avoid another branching here, we perform the rest of the
     // method regardless, knowning that the whole write will be aborted
     // upon key duplication, and the rest of the states wouldn't matter.
-    bool keyDuplicated = data[index];
+    const bool keyDuplicated = data[index];
     ranges_.add(offset, 1);
     data[index] = true;
     return !keyDuplicated;
@@ -1313,15 +1381,14 @@ class FlatMapFieldWriter : public FieldWriter {
         nullsStream_{context_.createNullsStreamData(
             typeBuilder_->asFlatMap().nullsDescriptor(),
             type->id())} {
-    auto statsBuilder = context.getStatsCollector(type->id());
+    auto* statsBuilder = context.getStatsCollector(type->id());
     // Sanity check that the stats builders are shared and thread safe.
-    NIMBLE_CHECK(statsBuilder->isShared());
-    statisticsCollector_ = statsBuilder->as<SharedStatisticsCollector>();
+    statisticsCollector_ = statsBuilder->asChecked<SharedStatisticsCollector>();
     auto keyStatsBuilder = context.getStatsCollector(type->childAt(0)->id());
-    NIMBLE_CHECK(keyStatsBuilder->isShared());
-    keyStatisticsCollector_ = keyStatsBuilder->as<SharedStatisticsCollector>();
+    keyStatisticsCollector_ =
+        keyStatsBuilder->asChecked<SharedStatisticsCollector>();
     for (auto id = valueType_->id(); id <= valueType_->maxId(); ++id) {
-      NIMBLE_CHECK(context.getStatsCollector(id)->isShared());
+      NIMBLE_CHECK(context.getStatsCollector(id)->shared());
     }
   }
 
@@ -1344,7 +1411,6 @@ class FlatMapFieldWriter : public FieldWriter {
           case velox::VectorEncoding::Simple::FLAT_MAP:
             ingestFlatMap(vector, ranges);
             return;
-
           default:
             ingestMap(vector, ranges, executor);
             return;
@@ -1476,23 +1542,18 @@ class FlatMapFieldWriter : public FieldWriter {
     NIMBLE_CHECK(
         currentValueFields_.empty() && allValueFields_.empty(),
         "Mixing map and flatmap vectors in the FlatMapFieldWriter is not supported");
-    const auto& flatMapVector = vector->as<velox::FlatMapVector>();
-    NIMBLE_CHECK(
-        flatMapVector,
-        fmt::format(
-            "Unexpected vector type. Expected decoded FLAT_MAP but got '{}'",
-            vector->toString()));
-
+    const auto* flatMapVector = vector->asChecked<velox::FlatMapVector>();
     const auto size = ranges.size();
     nullsStream_.ensureAdditionalNullsCapacity(
         flatMapVector->mayHaveNulls(), size);
 
     // First write top-level nulls, collecting the non-nulls ranges to write.
     OrderedRanges childRanges;
-    uint64_t nonNullCount = iterateNonNullIndices<true>(
-        ranges, nullsStream_.mutableNonNulls(), Flat{vector}, [&](auto offset) {
-          childRanges.add(offset, 1);
-        });
+    const uint64_t nonNullCount = iterateNonNullIndices<true>(
+        ranges,
+        nullsStream_.mutableNonNulls(),
+        FlatAdapter<>{vector},
+        [&](auto offset) { childRanges.add(offset, 1); });
 
     collectStatistics(size - nonNullCount, size);
     // For FlatMapVector ingestion, we need to compute the total key count by
@@ -1505,7 +1566,7 @@ class FlatMapFieldWriter : public FieldWriter {
     const auto& inMaps = flatMapVector->inMaps();
 
     // Helper to compute the occurrence count for a given key index.
-    auto computeKeyOccurrences = [&](size_t keyIndex) -> uint64_t {
+    const auto computeKeyOccurrences = [&](size_t keyIndex) -> uint64_t {
       if (keyIndex < inMaps.size() && inMaps[keyIndex] != nullptr) {
         uint64_t count = 0;
         const auto* rawInMaps = inMaps[keyIndex]->as<uint64_t>();
@@ -1525,7 +1586,8 @@ class FlatMapFieldWriter : public FieldWriter {
       for (size_t i = 0; i < flatMapVector->numDistinctKeys(); ++i) {
         const uint64_t keyOccurrences = computeKeyOccurrences(i);
         totalKeyCount += keyOccurrences;
-        if constexpr (K == velox::TypeKind::VARCHAR) {
+        if constexpr (
+            K == velox::TypeKind::VARCHAR || K == velox::TypeKind::VARBINARY) {
           const velox::StringView key = keysVector.valueAt(i);
           totalKeyStringSize += key.size() * keyOccurrences;
         }
@@ -1533,17 +1595,18 @@ class FlatMapFieldWriter : public FieldWriter {
     };
 
     if (flatMapVector->distinctKeys()->isFlatEncoding()) {
-      collectKeyStats(Flat<KeyType>{flatMapVector->distinctKeys()});
+      collectKeyStats(FlatAdapter<KeyType>{flatMapVector->distinctKeys()});
     } else {
       auto decodingContext = context_.decodingContext();
       OrderedRanges keyRanges;
       keyRanges.add(0, flatMapVector->distinctKeys()->size());
       auto& decodedKeys =
           decodingContext.decode(flatMapVector->distinctKeys(), keyRanges);
-      collectKeyStats(Decoded<KeyType>{decodedKeys});
+      collectKeyStats(DecodedAdapter<KeyType>{decodedKeys});
     }
 
-    if constexpr (K == velox::TypeKind::VARCHAR) {
+    if constexpr (
+        K == velox::TypeKind::VARCHAR || K == velox::TypeKind::VARBINARY) {
       collectMapStringKeyStatistics(totalKeyCount, totalKeyStringSize, 0, size);
     } else {
       collectKeyStatistics(totalKeyCount, 0, size);
@@ -1565,7 +1628,7 @@ class FlatMapFieldWriter : public FieldWriter {
         // Ideally we wouldn't need to convert the key to a string, but this is
         // done for backward compatibility with ingestRow().
         const auto& key = flatMapKeyToString(keysVector.valueAt(i));
-        VELOX_CHECK(
+        NIMBLE_CHECK(
             distinctKeySet.find(key) == distinctKeySet.end(),
             "FlatMapVector keys are not distinct.");
         distinctKeySet.insert(key);
@@ -1587,14 +1650,14 @@ class FlatMapFieldWriter : public FieldWriter {
     };
 
     if (flatMapVector->distinctKeys()->isFlatEncoding()) {
-      processKeys(Flat<KeyType>{flatMapVector->distinctKeys()});
+      processKeys(FlatAdapter<KeyType>{flatMapVector->distinctKeys()});
     } else {
       auto decodingContext = context_.decodingContext();
       OrderedRanges keyRanges;
       keyRanges.add(0, flatMapVector->distinctKeys()->size());
       auto& decodedKeys =
           decodingContext.decode(flatMapVector->distinctKeys(), keyRanges);
-      processKeys(Decoded<KeyType>{decodedKeys});
+      processKeys(DecodedAdapter<KeyType>{decodedKeys});
     }
   }
 
@@ -1613,15 +1676,17 @@ class FlatMapFieldWriter : public FieldWriter {
 
     OrderedRanges childRanges;
     uint64_t nonNullCount = iterateNonNullIndices<true>(
-        ranges, nullsStream_.mutableNonNulls(), Flat{vector}, [&](auto offset) {
-          childRanges.add(offset, 1);
-        });
+        ranges,
+        nullsStream_.mutableNonNulls(),
+        FlatAdapter<>{vector},
+        [&](auto offset) { childRanges.add(offset, 1); });
 
     collectStatistics(size - nonNullCount, size);
     // For ROW vector ingestion (passthrough flatmaps), keys are ROW field
-    // names. For VARCHAR keys, use actual string lengths instead of
+    // names. For VARCHAR/VARBINARY keys, use actual string lengths instead of
     // sizeof(StringView).
-    if constexpr (K == velox::TypeKind::VARCHAR) {
+    if constexpr (
+        K == velox::TypeKind::VARCHAR || K == velox::TypeKind::VARBINARY) {
       collectPassthroughStringKeyStatistics(rowVector, nonNullCount, 0, size);
     } else {
       // For non-string keys, all keys are present for all non-null rows.
@@ -1654,35 +1719,37 @@ class FlatMapFieldWriter : public FieldWriter {
     NIMBLE_CHECK(
         currentPassthroughFields_.empty(),
         "Mixing map and flatmap vectors in the FlatMapFieldWriter is not supported");
-    auto size = ranges.size();
-    const velox::vector_size_t* offsets;
-    const velox::vector_size_t* lengths;
-    uint32_t nonNullCount = 0;
-    uint64_t totalKeyCount = 0;
-    uint64_t totalKeyStringSize =
-        0; // Track actual string size for VARCHAR keys
+    const auto size = ranges.size();
+    const velox::vector_size_t* offsets{nullptr};
+    const velox::vector_size_t* lengths{nullptr};
+    uint32_t nonNullCount{0};
+    uint64_t totalKeyCount{0};
+    uint64_t totalKeyStringSize{
+        0}; // Track actual string size for VARCHAR/VARBINARY keys
     OrderedRanges keyRanges;
 
     // Lambda that iterates keys of a map and records the offsets to write to
     // a particular value node.
-    auto processMap = [&](velox::vector_size_t index, auto& keysVector) {
+    auto processMap = [&](velox::vector_size_t index, const auto& keysVector) {
       totalKeyCount += lengths[index];
       for (auto elementIdx = offsets[index], end = elementIdx + lengths[index];
            elementIdx < end;
            ++elementIdx) {
         // NOTE: check for the null key story here.
-        const auto& keyVector = keysVector.valueAt(elementIdx);
-        // Track string key sizes for VARCHAR keys
-        if constexpr (K == velox::TypeKind::VARCHAR) {
-          totalKeyStringSize += keyVector.size();
+        const auto& keyValue = keysVector.valueAt(elementIdx);
+        // Track string key sizes for VARCHAR/VARBINARY keys
+        if constexpr (
+            K == velox::TypeKind::VARCHAR || K == velox::TypeKind::VARBINARY) {
+          totalKeyStringSize += keyValue.size();
         }
-        auto valueField = getValueFieldWriter(keyVector, size);
+        auto* valueField = getValueFieldWriter(keyValue, size);
         // Add the value to the buffer by recording its offset in the values
         // vector.
+        const auto ret = valueField->add(elementIdx, nonNullCount);
         NIMBLE_CHECK(
-            valueField->add(elementIdx, nonNullCount),
+            ret,
             "Duplicate key: {} at flatmap with node id {}",
-            folly::to<std::string>(keyVector),
+            folly::to<std::string>(keyValue),
             nodeId_);
       }
       ++nonNullCount;
@@ -1695,10 +1762,10 @@ class FlatMapFieldWriter : public FieldWriter {
 
     // Lambda that iterates the vector
     auto processVector = [&](const auto& map, const auto& vector) {
-      auto& mapKeys = map->mapKeys();
-      if (auto flatKeys = mapKeys->template asFlatVector<KeyType>()) {
+      const auto& mapKeys = map->mapKeys();
+      if (auto* flatKeys = mapKeys->template asFlatVector<KeyType>()) {
         // Keys are flat.
-        Flat<KeyType> keysVector{mapKeys};
+        FlatAdapter<KeyType> keysVector{mapKeys};
         iterateNonNullIndices<true>(
             ranges, nullsStream_.mutableNonNulls(), vector, [&](auto offset) {
               processMap(offset, keysVector);
@@ -1709,7 +1776,7 @@ class FlatMapFieldWriter : public FieldWriter {
             ranges, nullsStream_.mutableNonNulls(), vector, computeKeyRanges);
         auto decodingContext = context_.decodingContext();
         auto& decodedKeys = decodingContext.decode(mapKeys, keyRanges);
-        Decoded<KeyType> keysVector{decodedKeys};
+        DecodedAdapter<KeyType> keysVector{decodedKeys};
         iterateNonNullIndices<true>(
             ranges, nullsStream_.mutableNonNulls(), vector, [&](auto offset) {
               processMap(offset, keysVector);
@@ -1723,25 +1790,23 @@ class FlatMapFieldWriter : public FieldWriter {
     }
 
     const velox::MapVector* map = vector->as<velox::MapVector>();
-    if (map) {
+    if (map != nullptr) {
       // Map is flat
       offsets = map->rawOffsets();
       lengths = map->rawSizes();
 
       nullsStream_.ensureAdditionalNullsCapacity(map->mayHaveNulls(), size);
-      processVector(map, Flat{vector});
+      processVector(map, FlatAdapter<>{vector});
     } else {
       // Map is encoded. Decode.
       auto decodingContext = context_.decodingContext();
       auto& decodedMap = decodingContext.decode(vector, ranges);
-      map = decodedMap.base()->template as<velox::MapVector>();
-      NIMBLE_CHECK_NOT_NULL(map, "Unexpected vector type");
+      map = decodedMap.base()->template asChecked<velox::MapVector>();
       offsets = map->rawOffsets();
       lengths = map->rawSizes();
-
       nullsStream_.ensureAdditionalNullsCapacity(
           decodedMap.mayHaveNulls(), size);
-      processVector(map, Decoded{decodedMap});
+      processVector(map, DecodedAdapter<>{decodedMap});
     }
 
     // Now actually ingest the map values
@@ -1761,9 +1826,10 @@ class FlatMapFieldWriter : public FieldWriter {
     nonNullCount_ += nonNullCount;
 
     collectStatistics(size - nonNullCount, size);
-    // For VARCHAR keys in MAP vectors, use the actual string sizes tracked
-    // during processMap iteration, not sizeof(StringView).
-    if constexpr (K == velox::TypeKind::VARCHAR) {
+    // For VARCHAR/VARBINARY keys in MAP vectors, use the actual string sizes
+    // tracked during processMap iteration, not sizeof(StringView).
+    if constexpr (
+        K == velox::TypeKind::VARCHAR || K == velox::TypeKind::VARBINARY) {
       collectMapStringKeyStatistics(totalKeyCount, totalKeyStringSize, 0, size);
     } else {
       // totalKeyCount is the sum of all map entry counts tracked during
@@ -1809,7 +1875,7 @@ class FlatMapFieldWriter : public FieldWriter {
       return it->second;
     }
 
-    auto stringKey = folly::to<std::string>(key);
+    const auto stringKey = folly::to<std::string>(key);
     NIMBLE_DCHECK(!stringKey.empty(), "String key cannot be empty for flatmap");
 
     // check whether the typebuilder for this key is already present
@@ -1914,7 +1980,9 @@ class ArrayWithOffsetsFieldWriter : public FieldWriter {
         cached_(false),
         cachedValue_(nullptr),
         cachedSize_(0),
-        statisticsCollector_{context.getStatsCollector(type->id())} {
+        statisticsCollector_{context.getStatsCollector(type->id())},
+        elementStatisticsCollector_{
+            context.getStatsCollector(type->childAt(0)->id())} {
     elements_ = FieldWriter::create(context, type->childAt(0));
 
     typeBuilder_->asArrayWithOffsets().setChildren(elements_->typeBuilder());
@@ -1928,7 +1996,11 @@ class ArrayWithOffsetsFieldWriter : public FieldWriter {
       const OrderedRanges& ranges,
       folly::Executor*) override {
     OrderedRanges childFilteredRanges;
+    // childItemCount is the (logical) total cardinality of array elements.
+    uint64_t childItemCount = 0;
+    uint64_t elementNullCount = 0;
     const velox::ArrayVector* array;
+    uint64_t nullCount = 0;
     // To unwrap the dictionaryVector we need to cast into ComplexType before
     // extracting value arrayVector
     const auto dictionaryVector =
@@ -1937,12 +2009,52 @@ class ArrayWithOffsetsFieldWriter : public FieldWriter {
         dictionaryVector->valueVector()->template as<velox::ArrayVector>() &&
         isDictionaryValidRunLengthEncoded(*dictionaryVector)) {
       array = ingestLengthsOffsetsAlreadyEncoded(
-          *dictionaryVector, ranges, childFilteredRanges);
+          *dictionaryVector,
+          ranges,
+          childFilteredRanges,
+          nullCount,
+          childItemCount,
+          elementNullCount);
     } else {
-      array = ingestLengthsOffsets(vector, ranges, childFilteredRanges);
+      array = ingestLengthsOffsets(
+          vector,
+          ranges,
+          childFilteredRanges,
+          nullCount,
+          childItemCount,
+          elementNullCount);
     }
     if (childFilteredRanges.size() > 0) {
       elements_->write(array->elements(), childFilteredRanges);
+    }
+    // Adjust child stats to account for deduplicated elements.
+    // Child writers only see the deduplicated ranges, so their valueCount
+    // is the deduplicated count. We need to add the difference to get
+    // the full (non-deduplicated) valueCount. Similarly for null counts.
+    auto dedupedChildItemCount = childFilteredRanges.size();
+    if (childItemCount > dedupedChildItemCount) {
+      // Count nulls in deduplicated child elements.
+      uint64_t dedupedElementNullCount = 0;
+      auto* elements = array->elements().get();
+      if (elements->mayHaveNulls()) {
+        const auto* elementNulls = elements->rawNulls();
+        if (elementNulls != nullptr) {
+          childFilteredRanges.apply([&](auto offset, auto count) {
+            dedupedElementNullCount +=
+                velox::bits::countNulls(elementNulls, offset, offset + count);
+          });
+        }
+      }
+      auto additionalItemCount = childItemCount - dedupedChildItemCount;
+      auto additionalNullCount = elementNullCount - dedupedElementNullCount;
+      // Calculate the raw size for the additional (duplicated) elements.
+      // Non-null elements take sizeof(SourceType) bytes, nulls take 1 byte.
+      // NOTE: the elements are statically asserted to be fixed width types.
+      auto additionalRawSize =
+          (additionalItemCount - additionalNullCount) * sizeof(SourceType) +
+          additionalNullCount;
+      amendChildStatistics(
+          additionalItemCount, additionalNullCount, additionalRawSize);
     }
 
     // Calculate non-deduplicated logical size.
@@ -1955,7 +2067,7 @@ class ArrayWithOffsetsFieldWriter : public FieldWriter {
       // non-deduplicated sizes from deduplicated vectors without needing to
       // rely on an external util.
       collectStatistics(
-          context.nullCount,
+          nullCount,
           ranges.size(),
           getRawSizeFromVector(vector, ranges, context));
     }
@@ -1989,6 +2101,23 @@ class ArrayWithOffsetsFieldWriter : public FieldWriter {
     statisticsCollector_->addLogicalSize(logicalSize);
   }
 
+  // Collects additional child element statistics for deduplicated elements.
+  // This is needed because child writers only see deduplicated ranges, so
+  // their valueCount would only reflect the deduplicated count. We need to
+  // add the difference (childItemCount- dedupedChildCount) to get the
+  // full valueCount. Similarly, we need to add the null count difference
+  // and the logical size for these additional elements.
+  void amendChildStatistics(
+      uint64_t additionalCount,
+      uint64_t additionalNullCount,
+      uint64_t additionalRawSize) {
+    if (elementStatisticsCollector_) {
+      elementStatisticsCollector_->addCounts(
+          additionalCount, additionalNullCount);
+      elementStatisticsCollector_->addLogicalSize(additionalRawSize);
+    }
+  }
+
   std::unique_ptr<FieldWriter> elements_;
   NullableContentStreamData<uint32_t>&
       offsetsStream_; /** offsets for each data after dedup */
@@ -2000,6 +2129,7 @@ class ArrayWithOffsetsFieldWriter : public FieldWriter {
   velox::VectorPtr cachedValue_{nullptr};
   velox::vector_size_t cachedSize_{0};
   StatisticsCollector* statisticsCollector_;
+  StatisticsCollector* elementStatisticsCollector_;
 
   /*
    * Check if the dictionary is valid run length encoded.
@@ -2029,7 +2159,10 @@ class ArrayWithOffsetsFieldWriter : public FieldWriter {
   velox::ArrayVector* ingestLengthsOffsetsAlreadyEncoded(
       const velox::DictionaryVector<velox::ComplexType>& dictionaryVector,
       const OrderedRanges& ranges,
-      OrderedRanges& filteredRanges) {
+      OrderedRanges& filteredRanges,
+      uint64_t& nullCount,
+      uint64_t& childItemCount,
+      uint64_t& elementNullCount) {
     auto size = ranges.size();
     offsetsStream_.ensureAdditionalNullsCapacity(
         dictionaryVector.mayHaveNulls(), size);
@@ -2037,15 +2170,36 @@ class ArrayWithOffsetsFieldWriter : public FieldWriter {
     auto& offsetsData = offsetsStream_.mutableData();
     auto& lengthsData = lengthsStream_.mutableData();
     auto& nonNulls = offsetsStream_.mutableNonNulls();
+    nullCount = 0;
+    childItemCount = 0;
+    elementNullCount = 0;
 
     const velox::vector_size_t* offsets =
         dictionaryVector.indices()->template as<velox::vector_size_t>();
     auto valuesArrayVector =
         dictionaryVector.valueVector()->template as<velox::ArrayVector>();
 
+    // Get element null pointers for null counting.
+    auto* elementsVector = valuesArrayVector->elements().get();
+    const uint64_t* elementNulls =
+        elementsVector->mayHaveNulls() ? elementsVector->rawNulls() : nullptr;
+    const velox::vector_size_t* valuesOffsets = valuesArrayVector->rawOffsets();
+    const velox::vector_size_t* valuesSizes = valuesArrayVector->rawSizes();
+
     auto previousOffset = -1;
     bool newElementIngested = false;
     auto ingestDictionaryIndex = [&](auto index) {
+      const auto& dictIndex = offsets[index];
+      auto numElement = valuesSizes[dictIndex];
+      // Track total child count for all array elements (including duplicates).
+      childItemCount += numElement;
+      // Track null counts in child elements.
+      if (numElement > 0 && elementNulls) {
+        auto childOffset = valuesOffsets[dictIndex];
+        elementNullCount += velox::bits::countNulls(
+            elementNulls, childOffset, childOffset + numElement);
+      }
+
       bool match = false;
       // Only write length if first element or if consecutive offset is
       // different, meaning we have reached a new value element.
@@ -2054,7 +2208,7 @@ class ArrayWithOffsetsFieldWriter : public FieldWriter {
       } else if (cached_) {
         velox::CompareFlags flags;
         match =
-            (valuesArrayVector->sizeAt(offsets[index]) == cachedSize_ &&
+            (numElement == cachedSize_ &&
              valuesArrayVector
                      ->compare(cachedValue_.get(), offsets[index], 0, flags)
                      .value_or(-1) == 0);
@@ -2062,7 +2216,7 @@ class ArrayWithOffsetsFieldWriter : public FieldWriter {
 
       if (!match) {
         auto arrayOffset = valuesArrayVector->offsetAt(offsets[index]);
-        auto length = valuesArrayVector->sizeAt(offsets[index]);
+        auto length = numElement;
         lengthsData.push_back(length);
         newElementIngested = true;
         if (length > 0) {
@@ -2081,6 +2235,8 @@ class ArrayWithOffsetsFieldWriter : public FieldWriter {
         nonNulls.push_back(notNull);
         if (notNull) {
           ingestDictionaryIndex(index);
+        } else {
+          ++nullCount;
         }
       });
     } else {
@@ -2233,16 +2389,32 @@ class ArrayWithOffsetsFieldWriter : public FieldWriter {
   const velox::ArrayVector* ingestLengthsOffsets(
       const velox::VectorPtr& vector,
       const OrderedRanges& ranges,
-      OrderedRanges& filteredRanges) {
+      OrderedRanges& filteredRanges,
+      uint64_t& nullCount,
+      uint64_t& childItemCount,
+      uint64_t& elementNullCount) {
     auto size = ranges.size();
     const velox::ArrayVector* arrayVector = vector->as<velox::ArrayVector>();
     const velox::vector_size_t* rawOffsets;
     const velox::vector_size_t* rawLengths;
     OrderedRanges childRanges;
+    childItemCount = 0;
+    elementNullCount = 0;
+
+    // Get element null pointer for null counting.
+    const uint64_t* elementNulls = nullptr;
 
     auto proc = [&](velox::vector_size_t index) {
       auto length = rawLengths[index];
+      // Track total child count for all array elements (including duplicates).
+      childItemCount += length;
+      // Track null counts in child elements.
       if (length > 0) {
+        if (elementNulls != nullptr) {
+          auto childOffset = rawOffsets[index];
+          elementNullCount += velox::bits::countNulls(
+              elementNulls, childOffset, childOffset + length);
+        }
         childRanges.add(rawOffsets[index], length);
       }
     };
@@ -2250,12 +2422,16 @@ class ArrayWithOffsetsFieldWriter : public FieldWriter {
     if (arrayVector) {
       rawOffsets = arrayVector->rawOffsets();
       rawLengths = arrayVector->rawSizes();
+      // Initialize element null pointer for child null counting.
+      auto* elementsVector = arrayVector->elements().get();
+      elementNulls = elementsVector->rawNulls();
 
       offsetsStream_.ensureAdditionalNullsCapacity(
           arrayVector->mayHaveNulls(), size);
-      Flat iterableVector{vector};
-      iterateNonNullIndices<true>(
+      FlatAdapter<> iterableVector{vector};
+      auto nonNullCount = iterateNonNullIndices<true>(
           ranges, offsetsStream_.mutableNonNulls(), iterableVector, proc);
+      nullCount = size - nonNullCount;
       ingestLengthsOffsetsByElements(
           arrayVector, iterableVector, ranges, childRanges, filteredRanges);
     } else {
@@ -2265,12 +2441,16 @@ class ArrayWithOffsetsFieldWriter : public FieldWriter {
       NIMBLE_CHECK_NOT_NULL(arrayVector, "Unexpected vector type");
       rawOffsets = arrayVector->rawOffsets();
       rawLengths = arrayVector->rawSizes();
+      // Initialize element null pointer for child null counting.
+      auto* elementsVector = arrayVector->elements().get();
+      elementNulls = elementsVector->rawNulls();
 
       offsetsStream_.ensureAdditionalNullsCapacity(
           decoded.mayHaveNulls(), size);
-      Decoded iterableVector{decoded};
-      iterateNonNullIndices<true>(
+      DecodedAdapter<> iterableVector{decoded};
+      auto nonNullCount = iterateNonNullIndices<true>(
           ranges, offsetsStream_.mutableNonNulls(), iterableVector, proc);
+      nullCount = size - nonNullCount;
       ingestLengthsOffsetsByElements(
           arrayVector, iterableVector, ranges, childRanges, filteredRanges);
     }
@@ -2346,7 +2526,7 @@ DecodingContextPool::DecodingContextPool(
     std::function<void(void)> vectorDecoderVisitor)
     : vectorDecoderVisitor_{std::move(vectorDecoderVisitor)} {
   NIMBLE_CHECK(vectorDecoderVisitor_, "vectorDecoderVisitor must be set");
-  pool_.reserve(folly::hardware_concurrency());
+  pool_.reserve(folly::available_concurrency());
 }
 
 void DecodingContextPool::addContext(

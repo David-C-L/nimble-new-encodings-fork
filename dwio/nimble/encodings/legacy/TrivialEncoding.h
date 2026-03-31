@@ -18,7 +18,6 @@
 #include <numeric>
 #include <span>
 
-#include "dwio/nimble/common/Bits.h"
 #include "dwio/nimble/common/Buffer.h"
 #include "dwio/nimble/common/EncodingPrimitives.h"
 #include "dwio/nimble/common/EncodingType.h"
@@ -197,6 +196,7 @@ TrivialEncoding<T>::TrivialEncoding(
     uncompressed_ = Compression::uncompress(
         memoryPool,
         compressionType,
+        TypeTraits<physicalType>::dataType,
         {data.data() + kDataOffset, data.size() - kDataOffset});
     values_ = reinterpret_cast<const T*>(uncompressed_.data());
     NIMBLE_CHECK(
@@ -246,7 +246,7 @@ std::string_view TrivialEncoding<T>::encode(
   char* reserved = buffer.reserve(encodingSize);
   char* pos = reserved;
   Encoding::serializePrefix(
-      EncodingType::Trivial, TypeTraits<T>::dataType, rowCount, pos);
+      EncodingType::Trivial, TypeTraits<T>::dataType, rowCount, false, pos);
   encoding::writeChar(
       static_cast<char>(compressionEncoder.compressionType()), pos);
   compressionEncoder.write(pos);
@@ -358,7 +358,10 @@ void TrivialEncoding<bool>::readWithVisitor(
       visitor,
       params,
       [&](auto toSkip) { skip(toSkip); },
-      [&] { return bits::getBit(row_++, bitmap_); });
+      [&] {
+        return velox::bits::isBitSet(
+            reinterpret_cast<const uint8_t*>(bitmap_), row_++);
+      });
 }
 
 } // namespace facebook::nimble::legacy

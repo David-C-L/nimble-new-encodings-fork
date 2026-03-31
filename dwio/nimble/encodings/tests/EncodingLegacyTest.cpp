@@ -18,7 +18,6 @@
 #include <memory>
 #include <span>
 #include <vector>
-#include "dwio/nimble/common/Bits.h"
 #include "dwio/nimble/common/Buffer.h"
 #include "dwio/nimble/common/FixedBitArray.h"
 #include "dwio/nimble/common/Types.h"
@@ -37,6 +36,7 @@
 #include "dwio/nimble/encodings/legacy/TrivialEncoding.h"
 #include "dwio/nimble/encodings/legacy/VarintEncoding.h"
 #include "folly/Random.h"
+#include "velox/common/base/BitUtil.h"
 #include "velox/common/memory/Memory.h"
 
 // Tests the Encoding API for all basic Encoding implementations and data types.
@@ -377,7 +377,9 @@ void checkScatteredOutput(
   }
 
   if (hasNulls) {
-    ASSERT_EQ(scatter[index], nimble::bits::getBit(index, nulls));
+    ASSERT_EQ(
+        scatter[index],
+        velox::bits::isBitSet(reinterpret_cast<const uint8_t*>(nulls), index));
   }
 }
 
@@ -431,7 +433,7 @@ TYPED_TEST(EncodingLegacyTest, scatteredMaterialize) {
           }
 
           auto newRowCount = scatter.size();
-          auto requiredBytes = nimble::bits::bytesRequired(newRowCount);
+          auto requiredBytes = velox::bits::nbytes(newRowCount);
           // Note: Internally, some bit implementations use word boundaries to
           // efficiently iterate on bitmaps. If the buffer doesn't end on a
           // word boundary, this leads to ASAN buffer overflow (debug builds).
@@ -442,14 +444,15 @@ TYPED_TEST(EncodingLegacyTest, scatteredMaterialize) {
           auto scatterPtr = scatterBuffer.reserve(requiredBytes);
           auto nullsPtr = nullsBuffer.reserve(requiredBytes);
           memset(scatterPtr, 0, requiredBytes);
-          nimble::bits::packBitmap(scatter, scatterPtr);
+          velox::bits::packBitmap(scatter, scatterPtr);
 
           nimble::Vector<E> buffer(this->pool_.get(), newRowCount);
 
           uint32_t expectedRow = 0;
           uint32_t actualRows = 0;
           {
-            nimble::bits::Bitmap scatterBitmap(scatterPtr, newRowCount);
+            velox::bits::Bitmap scatterBitmap(
+                scatterPtr, static_cast<uint32_t>(newRowCount));
             actualRows = encoding->materializeNullable(
                 rowCount,
                 buffer.data(),
@@ -475,7 +478,7 @@ TYPED_TEST(EncodingLegacyTest, scatteredMaterialize) {
           const int firstScatterSize = scatterSizes[firstBlock];
           expectedRow = 0;
           {
-            nimble::bits::Bitmap scatterBitmap(scatterPtr, firstScatterSize);
+            velox::bits::Bitmap scatterBitmap(scatterPtr, firstScatterSize);
             actualRows = encoding->materializeNullable(
                 firstBlock,
                 buffer.data(),
@@ -500,7 +503,8 @@ TYPED_TEST(EncodingLegacyTest, scatteredMaterialize) {
           const int secondScatterSize = scatter.size() - firstScatterSize;
           expectedRow = actualRows;
           {
-            nimble::bits::Bitmap scatterBitmap(scatterPtr, newRowCount);
+            velox::bits::Bitmap scatterBitmap(
+                scatterPtr, static_cast<uint32_t>(newRowCount));
             actualRows = encoding->materializeNullable(
                 secondBlock,
                 buffer.data(),
@@ -535,7 +539,7 @@ TYPED_TEST(EncodingLegacyTest, scatteredMaterialize) {
             auto scatterStart = scatterSizes[i];
             auto scatterEnd = scatterSizes[i + 1];
             {
-              nimble::bits::Bitmap scatterBitmap(scatterPtr, scatterEnd);
+              velox::bits::Bitmap scatterBitmap(scatterPtr, scatterEnd);
               actualRows = encoding->materializeNullable(
                   1,
                   buffer.data(),
@@ -572,7 +576,7 @@ TYPED_TEST(EncodingLegacyTest, scatteredMaterialize) {
             auto scatterStart = scatterSizes[start];
             auto scatterEnd = scatterSizes[start + len];
             {
-              nimble::bits::Bitmap scatterBitmap(scatterPtr, scatterEnd);
+              velox::bits::Bitmap scatterBitmap(scatterPtr, scatterEnd);
               actualRows = encoding->materializeNullable(
                   len,
                   buffer.data(),

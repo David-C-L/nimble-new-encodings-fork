@@ -19,7 +19,6 @@
 #include <memory>
 #include <span>
 #include <vector>
-#include "dwio/nimble/common/Bits.h"
 #include "dwio/nimble/common/Buffer.h"
 #include "dwio/nimble/common/FixedBitArray.h"
 #include "dwio/nimble/common/Types.h"
@@ -38,6 +37,7 @@
 #include "dwio/nimble/encodings/TrivialEncoding.h"
 #include "dwio/nimble/encodings/VarintEncoding.h"
 #include "folly/Random.h"
+#include "velox/common/base/BitUtil.h"
 #include "velox/common/memory/Memory.h"
 
 // Tests the Encoding API for all basic Encoding implementations and data types.
@@ -134,6 +134,7 @@ class TestTrivialEncodingSelectionPolicy
 };
 } // namespace
 
+
 // Helper template to get encoding type for each encoding class
 template <typename Encoding>
 struct EncodingTypeGetter;
@@ -184,9 +185,18 @@ struct EncodingTypeGetter<nimble::VarintEncoding<T>> {
 };
 
 // C is the encoding type.
-template <typename C>
+template <typename EncodingType, bool UseVarint>
+struct TestConfig {
+  using encoding_type = EncodingType;
+  static constexpr bool useVarint = UseVarint;
+};
+
+#define TC(T) TestConfig<T, false>, TestConfig<T, true>
+
+template <typename Config>
 class EncodingTest : public ::testing::Test {
  protected:
+  using C = typename Config::encoding_type;
   using E = typename C::cppDataType;
 
   void SetUp() override {
@@ -200,6 +210,7 @@ class EncodingTest : public ::testing::Test {
       bool compress,
       bool useVariableBitWidthCompressor,
       std::function<void*(uint32_t)> stringBufferFactory) {
+    constexpr bool useVarint = Config::useVarint;
     using physicalType = typename nimble::TypeTraits<E>::physicalType;
     auto physicalValues = std::span<const physicalType>(
         reinterpret_cast<const physicalType*>(values.data()), values.size());
@@ -214,8 +225,10 @@ class EncodingTest : public ::testing::Test {
         std::make_unique<TestTrivialEncodingSelectionPolicy<E>>(
             compress, useVariableBitWidthCompressor)};
 
-    auto encoded = C::encode(selection, physicalValues, *buffer_);
-    return std::make_unique<C>(*this->pool_, encoded, stringBufferFactory);
+    nimble::Encoding::Options options{.useVarintRowCount = useVarint};
+    auto encoded = C::encode(selection, physicalValues, *buffer_, options);
+    return std::make_unique<C>(
+        *this->pool_, encoded, stringBufferFactory, options);
   }
 
   // Each unit test runs on randomized data this many times before
@@ -232,21 +245,24 @@ class EncodingTest : public ::testing::Test {
   std::unique_ptr<nimble::testing::Util> util_;
 };
 
-#define VARINT_TYPES(EncodingName)                                      \
-  EncodingName<int32_t>, EncodingName<int64_t>, EncodingName<uint32_t>, \
-      EncodingName<uint64_t>, EncodingName<float>, EncodingName<double>
+#define VARINT_TYPES(EncodingName)                            \
+  TC(EncodingName<int32_t>), TC(EncodingName<int64_t>),       \
+      TC(EncodingName<uint32_t>), TC(EncodingName<uint64_t>), \
+      TC(EncodingName<float>), TC(EncodingName<double>)
 
-#define NUMERIC_TYPES(EncodingName)                                        \
-  VARINT_TYPES(EncodingName), EncodingName<int8_t>, EncodingName<uint8_t>, \
-      EncodingName<int16_t>, EncodingName<uint16_t>
+#define NUMERIC_TYPES(EncodingName)                         \
+  VARINT_TYPES(EncodingName), TC(EncodingName<int8_t>),     \
+      TC(EncodingName<uint8_t>), TC(EncodingName<int16_t>), \
+      TC(EncodingName<uint16_t>)
 
 #define NON_BOOL_TYPES(EncodingName) \
-  NUMERIC_TYPES(EncodingName), EncodingName<std::string_view>
+  NUMERIC_TYPES(EncodingName), TC(EncodingName<std::string_view>)
 
-#define ALL_TYPES(EncodingName) NON_BOOL_TYPES(EncodingName), EncodingName<bool>
+#define ALL_TYPES(EncodingName) \
+  NON_BOOL_TYPES(EncodingName), TC(EncodingName<bool>)
 
 using TestTypes = ::testing::Types<
-    nimble::SparseBoolEncoding,
+    TC(nimble::SparseBoolEncoding),
     VARINT_TYPES(nimble::VarintEncoding),
     NUMERIC_TYPES(nimble::FixedBitWidthEncoding),
     NON_BOOL_TYPES(nimble::DictionaryEncoding),
@@ -262,7 +278,7 @@ TYPED_TEST(EncodingTest, materialize) {
   LOG(INFO) << "seed: " << seed;
   std::mt19937 rng(seed);
 
-  using E = typename TypeParam::cppDataType;
+  using E = typename TypeParam::encoding_type::cppDataType;
 
   for (int run = 0; run < this->kNumRandomRuns; ++run) {
     const std::vector<nimble::Vector<E>> dataPatterns =
@@ -271,6 +287,11 @@ TYPED_TEST(EncodingTest, materialize) {
     for (const auto& data : dataPatterns) {
       for (auto compress : {false, true}) {
         for (auto useVariableBitWidthCompressor : {false, true}) {
+          SCOPED_TRACE(
+              fmt::format(
+                  "compress {}, variableBitWidth {}",
+                  compress,
+                  useVariableBitWidthCompressor));
           const int rowCount = data.size();
           ASSERT_GT(rowCount, 0);
           std::unique_ptr<nimble::Encoding> encoding;
@@ -294,6 +315,7 @@ TYPED_TEST(EncodingTest, materialize) {
             throw;
           }
           ASSERT_EQ(encoding->dataType(), nimble::TypeTraits<E>::dataType);
+          ASSERT_EQ(encoding->rowCount(), rowCount);
           nimble::Vector<E> buffer(this->pool_.get(), rowCount);
 
           encoding->materialize(rowCount, buffer.data());
@@ -364,12 +386,14 @@ void checkScatteredOutput(
   }
 
   if (hasNulls) {
-    ASSERT_EQ(scatter[index], nimble::bits::getBit(index, nulls));
+    ASSERT_EQ(
+        scatter[index],
+        velox::bits::isBitSet(reinterpret_cast<const uint8_t*>(nulls), index));
   }
 }
 
 TYPED_TEST(EncodingTest, scatteredMaterialize) {
-  using E = typename TypeParam::cppDataType;
+  using E = typename TypeParam::encoding_type::cppDataType;
 
   auto seed = folly::Random::rand32();
   LOG(INFO) << "seed: " << seed;
@@ -418,7 +442,7 @@ TYPED_TEST(EncodingTest, scatteredMaterialize) {
           }
 
           auto newRowCount = scatter.size();
-          auto requiredBytes = nimble::bits::bytesRequired(newRowCount);
+          auto requiredBytes = velox::bits::nbytes(newRowCount);
           // Note: Internally, some bit implementations use word boundaries to
           // efficiently iterate on bitmaps. If the buffer doesn't end on a
           // word boundary, this leads to ASAN buffer overflow (debug builds).
@@ -429,14 +453,15 @@ TYPED_TEST(EncodingTest, scatteredMaterialize) {
           auto scatterPtr = scatterBuffer.reserve(requiredBytes);
           auto nullsPtr = nullsBuffer.reserve(requiredBytes);
           memset(scatterPtr, 0, requiredBytes);
-          nimble::bits::packBitmap(scatter, scatterPtr);
+          velox::bits::packBitmap(scatter, scatterPtr);
 
           nimble::Vector<E> buffer(this->pool_.get(), newRowCount);
 
           uint32_t expectedRow = 0;
           uint32_t actualRows = 0;
           {
-            nimble::bits::Bitmap scatterBitmap(scatterPtr, newRowCount);
+            velox::bits::Bitmap scatterBitmap(
+                scatterPtr, static_cast<uint32_t>(newRowCount));
             actualRows = encoding->materializeNullable(
                 rowCount,
                 buffer.data(),
@@ -462,7 +487,7 @@ TYPED_TEST(EncodingTest, scatteredMaterialize) {
           const int firstScatterSize = scatterSizes[firstBlock];
           expectedRow = 0;
           {
-            nimble::bits::Bitmap scatterBitmap(scatterPtr, firstScatterSize);
+            velox::bits::Bitmap scatterBitmap(scatterPtr, firstScatterSize);
             actualRows = encoding->materializeNullable(
                 firstBlock,
                 buffer.data(),
@@ -487,7 +512,8 @@ TYPED_TEST(EncodingTest, scatteredMaterialize) {
           const int secondScatterSize = scatter.size() - firstScatterSize;
           expectedRow = actualRows;
           {
-            nimble::bits::Bitmap scatterBitmap(scatterPtr, newRowCount);
+            velox::bits::Bitmap scatterBitmap(
+                scatterPtr, static_cast<uint32_t>(newRowCount));
             actualRows = encoding->materializeNullable(
                 secondBlock,
                 buffer.data(),
@@ -522,7 +548,7 @@ TYPED_TEST(EncodingTest, scatteredMaterialize) {
             auto scatterStart = scatterSizes[i];
             auto scatterEnd = scatterSizes[i + 1];
             {
-              nimble::bits::Bitmap scatterBitmap(scatterPtr, scatterEnd);
+              velox::bits::Bitmap scatterBitmap(scatterPtr, scatterEnd);
               actualRows = encoding->materializeNullable(
                   1,
                   buffer.data(),
@@ -559,7 +585,7 @@ TYPED_TEST(EncodingTest, scatteredMaterialize) {
             auto scatterStart = scatterSizes[start];
             auto scatterEnd = scatterSizes[start + len];
             {
-              nimble::bits::Bitmap scatterBitmap(scatterPtr, scatterEnd);
+              velox::bits::Bitmap scatterBitmap(scatterPtr, scatterEnd);
               actualRows = encoding->materializeNullable(
                   len,
                   buffer.data(),

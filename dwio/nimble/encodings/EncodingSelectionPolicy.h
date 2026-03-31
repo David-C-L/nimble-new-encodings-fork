@@ -121,7 +121,7 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
  public:
   ManualEncodingSelectionPolicy(
       std::vector<std::pair<EncodingType, float>> readFactors,
-      CompressionOptions compressionOptions,
+      std::optional<CompressionOptions> compressionOptions,
       std::optional<NestedEncodingIdentifier> identifier)
       : readFactors_{std::move(readFactors)},
         compressionOptions_{std::move(compressionOptions)},
@@ -161,6 +161,13 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
       std::span<const physicalType> values,
       const Statistics<physicalType>& statistics) override {
     if (values.empty()) {
+      return {
+          .encodingType = EncodingType::Trivial,
+      };
+    }
+
+    // Fast path: when there are no candidate encodings, fall back to Trivial.
+    if (readFactors_.empty()) {
       return {
           .encodingType = EncodingType::Trivial,
       };
@@ -272,10 +279,13 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
         << (values.size() > size_t(NIMBLE_ENCODING_SELECTION_DEBUG_MAX_ITEMS)
                 ? "..."
                 : ""));
+    if (!compressionOptions_.has_value()) {
+      return {.encodingType = selectedEncoding};
+    }
     return {
         .encodingType = selectedEncoding,
         .compressionPolicyFactory = [compressionOptions =
-                                         compressionOptions_]() {
+                                         compressionOptions_.value()]() {
           return std::make_unique<AlwaysCompressPolicy>(compressionOptions);
         }};
   }
@@ -293,10 +303,6 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
     return readFactors_;
   }
 
-  float compressionAcceptRatio() const {
-    return compressionOptions_.compressionAcceptRatio;
-  }
-
  private:
   // These read factors are used to raise or lower the chances of an encoding to
   // be picked. Right now, these represent mostly the cpu cost to decode the
@@ -305,7 +311,9 @@ class ManualEncodingSelectionPolicy : public EncodingSelectionPolicy<T> {
   // See ManualEncodingSelectionPolicyFactory::defaultReadFactors for the
   // default.
   const std::vector<std::pair<EncodingType, float>> readFactors_;
-  const CompressionOptions compressionOptions_;
+  // When nullopt, compression is disabled for this policy and all nested
+  // policies created from it.
+  const std::optional<CompressionOptions> compressionOptions_;
   const std::optional<NestedEncodingIdentifier> identifier_;
 };
 
@@ -335,7 +343,8 @@ class ManualEncodingSelectionPolicyFactory {
   ManualEncodingSelectionPolicyFactory(
       std::vector<std::pair<EncodingType, float>> readFactors =
           defaultReadFactors(),
-      CompressionOptions compressionOptions = {})
+      std::optional<CompressionOptions> compressionOptions =
+          CompressionOptions{})
       : readFactors_{std::move(readFactors)},
         compressionOptions_{std::move(compressionOptions)} {}
 
@@ -429,7 +438,7 @@ class ManualEncodingSelectionPolicyFactory {
 
  private:
   const std::vector<std::pair<EncodingType, float>> readFactors_;
-  const CompressionOptions compressionOptions_;
+  const std::optional<CompressionOptions> compressionOptions_;
 };
 
 // This is a learned encoding selection implementation.
@@ -601,23 +610,29 @@ class ReplayedEncodingSelectionPolicy
  public:
   ReplayedEncodingSelectionPolicy(
       EncodingLayout encodingLayout,
-      CompressionOptions compressionOptions,
+      std::optional<CompressionOptions> compressionOptions,
       const EncodingSelectionPolicyFactory& encodingSelectionPolicyFactory)
-      : encodingLayout_{encodingLayout},
-        compressionOptions_{std::move(compressionOptions)},
-        encodingSelectionPolicyFactory_{encodingSelectionPolicyFactory} {}
+      : compressionOptions_{std::move(compressionOptions)},
+        encodingSelectionPolicyFactory_{encodingSelectionPolicyFactory},
+        encodingLayout_{std::move(encodingLayout)} {}
 
   nimble::EncodingSelectionResult select(
       std::span<const physicalType> /* values */,
       const nimble::Statistics<physicalType>& /* statistics */) override {
     NIMBLE_SELECTION_LOG(
         CYAN << "Replaying encoding " << encodingLayout_.encodingType());
+    if (!compressionOptions_.has_value()) {
+      return {
+          .encodingType = encodingLayout_.encodingType(),
+          .encodingConfig = encodingLayout_.config(),
+      };
+    }
     return {
         .encodingType = encodingLayout_.encodingType(),
         .encodingConfig = encodingLayout_.config(),
         .compressionPolicyFactory = [this]() {
           return std::make_unique<ReplayedCompressionPolicy>(
-              encodingLayout_.compressionType(), compressionOptions_);
+              encodingLayout_.compressionType(), compressionOptions_.value());
         }};
   }
 
@@ -664,9 +679,11 @@ class ReplayedEncodingSelectionPolicy
   }
 
  private:
-  EncodingLayout encodingLayout_;
-  const CompressionOptions compressionOptions_;
+  const std::optional<CompressionOptions> compressionOptions_;
   const EncodingSelectionPolicyFactory& encodingSelectionPolicyFactory_;
+  EncodingLayout encodingLayout_;
 };
+
+#undef COMMA
 
 } // namespace facebook::nimble

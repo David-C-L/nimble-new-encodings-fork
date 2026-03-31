@@ -194,7 +194,8 @@ class Encoder {
   static std::string_view encode(
       nimble::Buffer& buffer,
       const nimble::Vector<T>& values,
-      CompressionType compressionType = CompressionType::Uncompressed) {
+      CompressionType compressionType = CompressionType::Uncompressed,
+      const nimble::Encoding::Options& options = {}) {
     using physicalType = typename nimble::TypeTraits<T>::physicalType;
 
     auto physicalValues = std::span<const physicalType>(
@@ -209,7 +210,7 @@ class Encoder {
         std::make_unique<TestTrivialEncodingSelectionPolicy<T>>(
             compressionType)};
 
-    return E::encode(selection, physicalValues, buffer);
+    return E::encode(selection, physicalValues, buffer, options);
   }
 
   static std::string_view encodeNullable(
@@ -217,7 +218,8 @@ class Encoder {
       const nimble::Vector<T>& values,
       const nimble::Vector<bool>& nulls,
       nimble::CompressionType compressionType =
-          nimble::CompressionType::Uncompressed) {
+          nimble::CompressionType::Uncompressed,
+      const nimble::Encoding::Options& options = {}) {
     using physicalType = typename nimble::TypeTraits<T>::physicalType;
 
     auto physicalValues = std::span<const physicalType>(
@@ -233,18 +235,20 @@ class Encoder {
             compressionType)};
 
     return NullableEncoding<typename E::cppDataType>::encodeNullable(
-        selection, physicalValues, nulls, buffer);
+        selection, physicalValues, nulls, buffer, options);
   }
 
   static std::unique_ptr<nimble::Encoding> createEncoding(
       nimble::Buffer& buffer,
       const nimble::Vector<T>& values,
       std::function<void*(uint32_t)> stringBufferFactory,
-      CompressionType compressionType = CompressionType::Uncompressed) {
+      CompressionType compressionType = CompressionType::Uncompressed,
+      const nimble::Encoding::Options& options = {}) {
     return std::make_unique<E>(
         buffer.getMemoryPool(),
-        encode(buffer, values, compressionType),
-        stringBufferFactory);
+        encode(buffer, values, compressionType, options),
+        stringBufferFactory,
+        options);
   }
 
   static std::unique_ptr<nimble::Encoding> createNullableEncoding(
@@ -252,11 +256,13 @@ class Encoder {
       const nimble::Vector<T>& values,
       const nimble::Vector<bool>& nulls,
       std::function<void*(uint32_t)> stringBufferFactory,
-      CompressionType compressionType = CompressionType::Uncompressed) {
+      CompressionType compressionType = CompressionType::Uncompressed,
+      const nimble::Encoding::Options& options = {}) {
     return std::make_unique<E>(
         buffer.getMemoryPool(),
-        encodeNullable(buffer, values, nulls, compressionType),
-        stringBufferFactory);
+        encodeNullable(buffer, values, nulls, compressionType, options),
+        stringBufferFactory,
+        options);
   }
 };
 

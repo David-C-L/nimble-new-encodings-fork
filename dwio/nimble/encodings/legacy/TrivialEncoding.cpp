@@ -38,6 +38,7 @@ TrivialEncoding<std::string_view>::TrivialEncoding(
     dataUncompressed_ = Compression::uncompress(
         memoryPool,
         dataCompressionType,
+        DataType::String,
         {blob_, static_cast<size_t>(data.end() - blob_)});
     blob_ = reinterpret_cast<const char*>(dataUncompressed_.data());
     uncompressedDataBytes_ = dataUncompressed_.size();
@@ -124,7 +125,7 @@ std::string_view TrivialEncoding<std::string_view>::encode(
   char* reserved = buffer.reserve(encodingSize);
   char* pos = reserved;
   Encoding::serializePrefix(
-      EncodingType::Trivial, DataType::String, valueCount, pos);
+      EncodingType::Trivial, DataType::String, valueCount, false, pos);
   encoding::writeChar(
       static_cast<char>(compressionEncoder.compressionType()), pos);
   encoding::writeUint32(serializedLengths.size(), pos);
@@ -148,6 +149,7 @@ TrivialEncoding<bool>::TrivialEncoding(
     uncompressed_ = Compression::uncompress(
         pool,
         compressionType,
+        DataType::Undefined,
         {bitmap_, static_cast<size_t>(data.end() - bitmap_)});
     bitmap_ = uncompressed_.data();
     NIMBLE_CHECK(
@@ -175,14 +177,16 @@ void TrivialEncoding<bool>::materialize(uint32_t rowCount, void* buffer) {
   const uint32_t rowsToWord = (row_ & 63) == 0 ? 0 : 64 - (row_ & 63);
   if (rowsToWord >= rowCount) {
     for (int i = 0; i < rowCount; ++i) {
-      *output = bits::getBit(row_, bitmap_);
+      *output = velox::bits::isBitSet(
+          reinterpret_cast<const uint8_t*>(bitmap_), row_);
       ++output;
       ++row_;
     }
     return;
   }
   for (uint32_t i = 0; i < rowsToWord; ++i) {
-    *output = bits::getBit(row_, bitmap_);
+    *output =
+        velox::bits::isBitSet(reinterpret_cast<const uint8_t*>(bitmap_), row_);
     ++output;
     ++row_;
   }
@@ -201,7 +205,8 @@ void TrivialEncoding<bool>::materialize(uint32_t rowCount, void* buffer) {
   }
   const uint32_t remainder = rowsRemaining - (numWords << 6);
   for (uint32_t i = 0; i < remainder; ++i) {
-    *output = bits::getBit(row_, bitmap_);
+    *output =
+        velox::bits::isBitSet(reinterpret_cast<const uint8_t*>(bitmap_), row_);
     ++output;
     ++row_;
   }
@@ -243,7 +248,7 @@ std::string_view TrivialEncoding<bool>::encode(
       [&](char*& pos) {
         memset(pos, 0, bitmapBytes);
         for (size_t i = 0; i < values.size(); ++i) {
-          bits::maybeSetBit(i, pos, values[i]);
+          velox::bits::maybeSetBit(pos, i, values[i]);
         }
         pos += bitmapBytes;
       }};
@@ -252,7 +257,7 @@ std::string_view TrivialEncoding<bool>::encode(
   char* reserved = buffer.reserve(encodingSize);
   char* pos = reserved;
   Encoding::serializePrefix(
-      EncodingType::Trivial, DataType::Bool, valueCount, pos);
+      EncodingType::Trivial, DataType::Bool, valueCount, false, pos);
   encoding::writeChar(
       static_cast<char>(compressionEncoder.compressionType()), pos);
   compressionEncoder.write(pos);

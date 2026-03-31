@@ -21,23 +21,27 @@ namespace facebook::nimble {
 TrivialEncoding<std::string_view>::TrivialEncoding(
     velox::memory::MemoryPool& memoryPool,
     std::string_view data,
-    std::function<void*(uint32_t)> stringBufferFactory)
-    : TypedEncoding<std::string_view, std::string_view>{memoryPool, data},
+    std::function<void*(uint32_t)> stringBufferFactory,
+    const Encoding::Options& options)
+    : TypedEncoding<
+          std::string_view,
+          std::string_view>{memoryPool, data, options},
       row_{0},
       buffer_{&memoryPool},
       dataUncompressed_{&memoryPool} {
-  auto pos = data.data() + kDataCompressionOffset;
+  auto pos = data.data() + this->dataOffset();
   const auto dataCompressionType =
       static_cast<CompressionType>(encoding::readChar(pos));
   const auto lengthsSize = encoding::readUint32(pos);
   lengths_ = EncodingFactory::decode(
-      memoryPool, {pos, lengthsSize}, stringBufferFactory);
+      memoryPool, {pos, lengthsSize}, stringBufferFactory, options);
   blob_ = pos + lengthsSize;
 
   if (dataCompressionType != CompressionType::Uncompressed) {
     dataUncompressed_ = Compression::uncompress(
         memoryPool,
         dataCompressionType,
+        DataType::String,
         {blob_, static_cast<size_t>(data.end() - blob_)});
     blob_ = reinterpret_cast<const char*>(dataUncompressed_.data());
     uncompressedDataBytes_ = dataUncompressed_.size();
@@ -126,7 +130,9 @@ std::optional<uint32_t> TrivialEncoding<std::string_view>::seekAtOrAfter(
 std::string_view TrivialEncoding<std::string_view>::encode(
     EncodingSelection<std::string_view>& selection,
     std::span<const std::string_view> values,
-    Buffer& buffer) {
+    Buffer& buffer,
+    const Encoding::Options& options) {
+  const bool useVarint = options.useVarintRowCount;
   const uint32_t valueCount = values.size();
   std::vector<uint32_t> lengths;
   lengths.reserve(valueCount);
@@ -137,7 +143,10 @@ std::string_view TrivialEncoding<std::string_view>::encode(
   Buffer tempBuffer{buffer.getMemoryPool()};
   std::string_view serializedLengths =
       selection.template encodeNested<uint32_t>(
-          EncodingIdentifiers::Trivial::Lengths, {lengths}, tempBuffer);
+          EncodingIdentifiers::Trivial::Lengths,
+          {lengths},
+          tempBuffer,
+          options);
 
   auto dataCompressionPolicy = selection.compressionPolicy();
   auto uncompressedSize = selection.statistics().totalStringsLength();
@@ -161,14 +170,15 @@ std::string_view TrivialEncoding<std::string_view>::encode(
         }
       }};
 
-  const uint32_t encodingSize = Encoding::kPrefixSize +
+  const uint32_t encodingSize =
+      Encoding::serializePrefixSize(valueCount, useVarint) +
       TrivialEncoding<std::string_view>::kPrefixSize +
       serializedLengths.size() + compressionEncoder.getSize();
 
   char* reserved = buffer.reserve(encodingSize);
   char* pos = reserved;
   Encoding::serializePrefix(
-      EncodingType::Trivial, DataType::String, valueCount, pos);
+      EncodingType::Trivial, DataType::String, valueCount, useVarint, pos);
   encoding::writeChar(
       static_cast<char>(compressionEncoder.compressionType()), pos);
   encoding::writeUint32(serializedLengths.size(), pos);
@@ -182,16 +192,18 @@ std::string_view TrivialEncoding<std::string_view>::encode(
 TrivialEncoding<bool>::TrivialEncoding(
     velox::memory::MemoryPool& pool,
     std::string_view data,
-    std::function<void*(uint32_t)> /* stringBufferFactory */)
-    : TypedEncoding<bool, bool>{pool, data},
-      bitmap_{data.data() + kDataOffset},
+    std::function<void*(uint32_t)> /* stringBufferFactory */,
+    const Encoding::Options& options)
+    : TypedEncoding<bool, bool>{pool, data, options},
+      bitmap_{data.data() + this->dataOffset() + kPrefixSize},
       uncompressed_{&pool} {
   const auto compressionType =
-      static_cast<CompressionType>(data[kCompressionTypeOffset]);
+      static_cast<CompressionType>(data[this->dataOffset()]);
   if (compressionType != CompressionType::Uncompressed) {
     uncompressed_ = Compression::uncompress(
         pool,
         compressionType,
+        DataType::Undefined,
         {bitmap_, static_cast<size_t>(data.end() - bitmap_)});
     bitmap_ = uncompressed_.data();
     NIMBLE_CHECK(
@@ -219,14 +231,16 @@ void TrivialEncoding<bool>::materialize(uint32_t rowCount, void* buffer) {
   const uint32_t rowsToWord = (row_ & 63) == 0 ? 0 : 64 - (row_ & 63);
   if (rowsToWord >= rowCount) {
     for (int i = 0; i < rowCount; ++i) {
-      *output = bits::getBit(row_, bitmap_);
+      *output = velox::bits::isBitSet(
+          reinterpret_cast<const uint8_t*>(bitmap_), row_);
       ++output;
       ++row_;
     }
     return;
   }
   for (uint32_t i = 0; i < rowsToWord; ++i) {
-    *output = bits::getBit(row_, bitmap_);
+    *output =
+        velox::bits::isBitSet(reinterpret_cast<const uint8_t*>(bitmap_), row_);
     ++output;
     ++row_;
   }
@@ -245,7 +259,8 @@ void TrivialEncoding<bool>::materialize(uint32_t rowCount, void* buffer) {
   }
   const uint32_t remainder = rowsRemaining - (numWords << 6);
   for (uint32_t i = 0; i < remainder; ++i) {
-    *output = bits::getBit(row_, bitmap_);
+    *output =
+        velox::bits::isBitSet(reinterpret_cast<const uint8_t*>(bitmap_), row_);
     ++output;
     ++row_;
   }
@@ -267,7 +282,9 @@ void TrivialEncoding<bool>::materializeBoolsAsBits(
 std::string_view TrivialEncoding<bool>::encode(
     EncodingSelection<bool>& selection,
     std::span<const bool> values,
-    Buffer& buffer) {
+    Buffer& buffer,
+    const Encoding::Options& options) {
+  const bool useVarint = options.useVarintRowCount;
   const uint32_t valueCount = values.size();
   const uint32_t bitmapBytes = FixedBitArray::bufferSize(valueCount, 1);
 
@@ -287,16 +304,18 @@ std::string_view TrivialEncoding<bool>::encode(
       [&](char*& pos) {
         memset(pos, 0, bitmapBytes);
         for (size_t i = 0; i < values.size(); ++i) {
-          bits::maybeSetBit(i, pos, values[i]);
+          velox::bits::maybeSetBit(pos, i, values[i]);
         }
         pos += bitmapBytes;
       }};
 
-  const uint32_t encodingSize = kDataOffset + compressionEncoder.getSize();
+  const uint32_t encodingSize =
+      Encoding::serializePrefixSize(valueCount, useVarint) + kPrefixSize +
+      compressionEncoder.getSize();
   char* reserved = buffer.reserve(encodingSize);
   char* pos = reserved;
   Encoding::serializePrefix(
-      EncodingType::Trivial, DataType::Bool, valueCount, pos);
+      EncodingType::Trivial, DataType::Bool, valueCount, useVarint, pos);
   encoding::writeChar(
       static_cast<char>(compressionEncoder.compressionType()), pos);
   compressionEncoder.write(pos);

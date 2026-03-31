@@ -28,8 +28,6 @@ using namespace facebook::velox;
 
 namespace {
 const std::string kSchemaSectionString(kSchemaSection);
-const std::vector<std::string> kPreloadOptionalSections = {
-    kSchemaSectionString};
 
 std::shared_ptr<const facebook::nimble::Type> loadSchema(
     const TabletReader& tablet) {
@@ -52,12 +50,10 @@ TypePtr getFileSchema(
 std::shared_ptr<ReaderBase> ReaderBase::create(
     std::unique_ptr<velox::dwio::common::BufferedInput> input,
     const velox::dwio::common::ReaderOptions& options) {
-  // Initialize all members
+  auto tabletOptions = TabletReader::configureOptions(options, input.get());
+
   auto tablet = TabletReader::create(
-      // TODO: Make TabletReader taking BufferedInput.
-      input->getReadFile().get(),
-      options.memoryPool(),
-      kPreloadOptionalSections);
+      input->getReadFile().get(), &options.memoryPool(), tabletOptions);
 
   auto* pool = &options.memoryPool();
   const auto& randomSkip = options.randomSkip();
@@ -123,21 +119,22 @@ std::shared_ptr<index::StreamIndex> StripeStreams::streamIndex(
     int streamId) const {
   NIMBLE_CHECK(stripeIdentifier_.has_value());
 
-  const auto& indexGroup = stripeIdentifier_->indexGroup();
-  if (indexGroup == nullptr) {
+  const auto& chunkIndex = stripeIdentifier_->chunkIndex();
+  if (chunkIndex == nullptr) {
     return nullptr;
   }
-  return indexGroup->createStreamIndex(stripe_, streamId);
+  return chunkIndex->createStreamIndex(stripe_, streamId);
 }
 
 std::unique_ptr<velox::dwio::common::SeekableInputStream>
 StripeStreams::enqueueKeyStream() {
   NIMBLE_CHECK(stripeIdentifier_.has_value());
 
-  const auto& indexGroup = stripeIdentifier_->indexGroup();
+  const auto& indexGroup = stripeIdentifier_->clusterIndex();
   NIMBLE_CHECK_NOT_NULL(indexGroup);
 
-  const auto region = indexGroup->keyStreamRegion(stripe_);
+  const auto region = indexGroup->keyStreamRegion(
+      stripe_, readerBase_->tablet().stripeOffset(stripe_));
   const dwio::common::StreamIdentifier sid(kKeyStreamId);
   return readerBase_->input().enqueue(region, &sid);
 }

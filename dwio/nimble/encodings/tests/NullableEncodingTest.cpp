@@ -41,6 +41,14 @@
 
 using namespace facebook;
 
+template <typename EncodingType, bool UseVarint>
+struct TestConfig {
+  using encoding_type = EncodingType;
+  static constexpr bool useVarint = UseVarint;
+};
+
+#define TC(T) TestConfig<T, false>, TestConfig<T, true>
+
 namespace {
 enum class NullsPattern {
   None,
@@ -49,10 +57,11 @@ enum class NullsPattern {
 };
 }
 
-// C is the encoding type.
-template <typename C>
+// Config wraps the encoding type and varint flag.
+template <typename Config>
 class NullableEncodingTest : public ::testing::Test {
  protected:
+  using C = typename Config::encoding_type;
   using E = typename C::cppDataType;
 
   void SetUp() override {
@@ -94,15 +103,17 @@ class NullableEncodingTest : public ::testing::Test {
   std::unique_ptr<nimble::testing::Util> util_;
 };
 
-#define ALL_TYPES(EncodingName)                                          \
-  EncodingName<int>, EncodingName<int64_t>, EncodingName<uint32_t>,      \
-      EncodingName<uint64_t>, EncodingName<float>, EncodingName<double>, \
-      EncodingName<std::string_view>, EncodingName<bool>
+#define ALL_TYPES(EncodingName)                               \
+  TC(EncodingName<int>), TC(EncodingName<int64_t>),           \
+      TC(EncodingName<uint32_t>), TC(EncodingName<uint64_t>), \
+      TC(EncodingName<float>), TC(EncodingName<double>),      \
+      TC(EncodingName<std::string_view>), TC(EncodingName<bool>)
 
-#define NON_BOOL_TYPES(EncodingName)                                     \
-  EncodingName<int>, EncodingName<int64_t>, EncodingName<uint32_t>,      \
-      EncodingName<uint64_t>, EncodingName<float>, EncodingName<double>, \
-      EncodingName<std::string_view>
+#define NON_BOOL_TYPES(EncodingName)                          \
+  TC(EncodingName<int>), TC(EncodingName<int64_t>),           \
+      TC(EncodingName<uint32_t>), TC(EncodingName<uint64_t>), \
+      TC(EncodingName<float>), TC(EncodingName<double>),      \
+      TC(EncodingName<std::string_view>)
 
 using TestTypes = ::testing::Types<
     ALL_TYPES(nimble::NullableEncoding),
@@ -131,7 +142,9 @@ nimble::Vector<E> spreadNullsIntoData(
 }
 
 TYPED_TEST(NullableEncodingTest, Materialize) {
-  using E = typename TypeParam::cppDataType;
+  using E = typename TypeParam::encoding_type::cppDataType;
+  const nimble::Encoding::Options options{
+      .useVarintRowCount = TypeParam::useVarint};
 
   auto seed = folly::Random::rand32();
   LOG(INFO) << "seed: " << seed;
@@ -159,7 +172,12 @@ TYPED_TEST(NullableEncodingTest, Materialize) {
         };
         auto encoding = nimble::test::Encoder<nimble::NullableEncoding<E>>::
             createNullableEncoding(
-                *this->buffer_, data, nulls, stringBufferFactory);
+                *this->buffer_,
+                data,
+                nulls,
+                stringBufferFactory,
+                nimble::CompressionType::Uncompressed,
+                options);
         ASSERT_EQ(encoding->dataType(), nimble::TypeTraits<E>::dataType);
         ASSERT_TRUE(encoding->isNullable());
         const uint32_t rowCount = encoding->rowCount();
@@ -230,12 +248,18 @@ void checkOutput(
     ASSERT_EQ(data[index], actualData[index]) << index;
   }
   if (hasNulls) {
-    ASSERT_EQ(nimble::bits::getBit(index, actualNulls), nulls[index]) << index;
+    ASSERT_EQ(
+        velox::bits::isBitSet(
+            reinterpret_cast<const uint8_t*>(actualNulls), index),
+        nulls[index])
+        << index;
   }
 }
 
 TYPED_TEST(NullableEncodingTest, ScatteredMaterialize) {
-  using E = typename TypeParam::cppDataType;
+  using E = typename TypeParam::encoding_type::cppDataType;
+  const nimble::Encoding::Options options{
+      .useVarintRowCount = TypeParam::useVarint};
 
   auto seed = folly::Random::rand32();
   LOG(INFO) << "seed: " << seed;
@@ -263,7 +287,12 @@ TYPED_TEST(NullableEncodingTest, ScatteredMaterialize) {
         };
         auto encoding = nimble::test::Encoder<nimble::NullableEncoding<E>>::
             createNullableEncoding(
-                *this->buffer_, data, nulls, stringBufferFactory);
+                *this->buffer_,
+                data,
+                nulls,
+                stringBufferFactory,
+                nimble::CompressionType::Uncompressed,
+                options);
         ASSERT_EQ(encoding->dataType(), nimble::TypeTraits<E>::dataType);
         ASSERT_TRUE(encoding->isNullable());
         const uint32_t rowCount = encoding->rowCount();
@@ -281,7 +310,7 @@ TYPED_TEST(NullableEncodingTest, ScatteredMaterialize) {
         }
 
         auto newRowCount = scatter.size();
-        auto requiredBytes = nimble::bits::bytesRequired(newRowCount);
+        auto requiredBytes = velox::bits::nbytes(newRowCount);
         // Note: Internally, some bit implementations use word boundaries to
         // efficiently iterate on bitmaps. If the buffer doesn't end on a word
         // boundary, this leads to ASAN buffer overflow (debug builds). So for
@@ -292,7 +321,7 @@ TYPED_TEST(NullableEncodingTest, ScatteredMaterialize) {
         auto scatterPtr = scatterBuffer.reserve(requiredBytes);
         auto nullsPtr = nullsBuffer.reserve(requiredBytes);
         memset(scatterPtr, 0, requiredBytes);
-        nimble::bits::packBitmap(scatter, scatterPtr);
+        velox::bits::packBitmap(scatter, scatterPtr);
 
         nimble::Vector<E> buffer(this->pool_.get(), newRowCount);
 
@@ -305,7 +334,7 @@ TYPED_TEST(NullableEncodingTest, ScatteredMaterialize) {
                         uint32_t scatterOffset = 0,
                         uint32_t expectedOffset = 0) {
           uint32_t expectedRow = 0;
-          nimble::bits::Bitmap bitmap{
+          velox::bits::Bitmap bitmap{
               scatterBitmap, scatterOffset + scatterCount};
           auto nonNullCount = encoding->materializeNullable(
               rowCount,
@@ -327,9 +356,9 @@ TYPED_TEST(NullableEncodingTest, ScatteredMaterialize) {
             if (nonNullCount != scatterCount) {
               ASSERT_EQ(
                   isSet,
-                  nimble::bits::getBit(
-                      i + scatterOffset,
-                      reinterpret_cast<const char*>(nullsBitmap)));
+                  velox::bits::isBitSet(
+                      reinterpret_cast<const uint8_t*>(nullsBitmap),
+                      i + scatterOffset));
             }
           }
 
@@ -342,8 +371,8 @@ TYPED_TEST(NullableEncodingTest, ScatteredMaterialize) {
         encoding->reset();
         const int firstBlock = newRowCount / 2;
 
-        auto firstBlockSetBits =
-            nimble::bits::countSetBits(0, firstBlock, scatterPtr);
+        auto firstBlockSetBits = velox::bits::countBits(
+            reinterpret_cast<const uint64_t*>(scatterPtr), 0, firstBlock);
 
         // Test reading first half of the data
         test(
@@ -353,7 +382,10 @@ TYPED_TEST(NullableEncodingTest, ScatteredMaterialize) {
 
         // Test reading second half of the data
         test(
-            nimble::bits::countSetBits(firstBlock, secondBlock, scatterPtr),
+            velox::bits::countBits(
+                reinterpret_cast<const uint64_t*>(scatterPtr),
+                firstBlock,
+                firstBlock + secondBlock),
             buffer.data(),
             nullsPtr,
             secondBlock,
@@ -416,7 +448,9 @@ TYPED_TEST(NullableEncodingTest, ScatteredMaterialize) {
 }
 
 TYPED_TEST(NullableEncodingTest, MaterializeNullable) {
-  using E = typename TypeParam::cppDataType;
+  using E = typename TypeParam::encoding_type::cppDataType;
+  const nimble::Encoding::Options options{
+      .useVarintRowCount = TypeParam::useVarint};
 
   auto seed = folly::Random::rand32();
   LOG(INFO) << "seed: " << seed;
@@ -443,7 +477,12 @@ TYPED_TEST(NullableEncodingTest, MaterializeNullable) {
         };
         auto encoding = nimble::test::Encoder<nimble::NullableEncoding<E>>::
             createNullableEncoding(
-                *this->buffer_, data, nulls, stringBufferFactory);
+                *this->buffer_,
+                data,
+                nulls,
+                stringBufferFactory,
+                nimble::CompressionType::Uncompressed,
+                options);
         ASSERT_TRUE(encoding->isNullable());
         const uint32_t rowCount = encoding->rowCount();
         nimble::Vector<E> buffer(this->pool_.get(), rowCount);

@@ -114,6 +114,9 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${SCRIPT_CXX_FLAGS}")
 
 message("FINAL CMAKE_CXX_FLAGS=${CMAKE_CXX_FLAGS}")
 
+add_compile_options(-ffunction-sections -fdata-sections)
+add_link_options(-Wl,--gc-sections)
+
 include(CTest) # include after project() but before add_subdirectory()
 
 # Try to find FlatBuffers with uppercase name first (newer versions)
@@ -177,3 +180,4 @@ add_subdirectory(dwio/nimble/encodings)
 add_subdirectory(dwio/nimble/index)
 add_subdirectory(dwio/nimble/tablet)
 add_subdirectory(dwio/nimble/velox)
+add_subdirectory(dwio/nimble/serializer)

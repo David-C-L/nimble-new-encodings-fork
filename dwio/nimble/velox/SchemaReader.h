@@ -17,8 +17,11 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
+#include <string_view>
 #include <vector>
 
+#include "dwio/nimble/common/Exceptions.h"
 #include "dwio/nimble/velox/SchemaTypes.h"
 
 // Schema reader provides a strongly typed, tree like, reader friendly facade on
@@ -165,6 +168,18 @@ class RowType : public Type {
   const std::shared_ptr<const Type>& childAt(size_t index) const;
   const std::string& nameAt(size_t index) const;
 
+  const std::vector<std::string>& names() const {
+    return names_;
+  }
+
+  const std::vector<std::shared_ptr<const Type>>& children() const {
+    return children_;
+  }
+
+  /// Finds a child by name.
+  /// @return Child index if found, std::nullopt otherwise.
+  std::optional<size_t> findChild(std::string_view name) const;
+
  protected:
   StreamDescriptor nullsDescriptor_;
   std::vector<std::string> names_;
@@ -186,6 +201,10 @@ class FlatMapType : public Type {
   size_t childrenCount() const;
   const std::shared_ptr<const Type>& childAt(size_t index) const;
   const std::string& nameAt(size_t index) const;
+
+  /// Finds a child (key) by name.
+  /// @return Child index if found, std::nullopt otherwise.
+  std::optional<size_t> findChild(std::string_view name) const;
 
  private:
   StreamDescriptor nullsDescriptor_;
@@ -236,5 +255,17 @@ class SchemaReader {
 std::ostream& operator<<(
     std::ostream& out,
     const std::shared_ptr<const Type>& root);
+
+/// Checks if a value type has data streams in the current stripe.
+///
+/// For most types, probes a single stream that is guaranteed to exist when the
+/// type has data (e.g., scalar data stream, array lengths stream). For Row and
+/// FlatMap types whose nulls stream may be omitted, recurses into children.
+///
+/// For FlatMap types, iterates all children because individual keys are
+/// independent — one child may have no data while another does.
+bool hasValueStreams(
+    const Type& type,
+    const std::function<bool(offset_size)>& hasStream);
 
 } // namespace facebook::nimble

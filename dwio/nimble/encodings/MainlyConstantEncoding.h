@@ -26,6 +26,7 @@
 #include "dwio/nimble/encodings/EncodingFactory.h"
 #include "dwio/nimble/encodings/EncodingIdentifier.h"
 #include "dwio/nimble/encodings/EncodingSelection.h"
+#include "velox/common/base/SimdUtil.h"
 #include "velox/common/memory/Memory.h"
 
 // Encodes data that is 'mainly' a single value by using a bool child vectors
@@ -68,8 +69,9 @@ class MainlyConstantEncodingBase
 
   MainlyConstantEncodingBase(
       velox::memory::MemoryPool& memoryPool,
-      std::string_view data)
-      : TypedEncoding<T, physicalType>(memoryPool, data),
+      std::string_view data,
+      const Encoding::Options& options = {})
+      : TypedEncoding<T, physicalType>(memoryPool, data, options),
         isCommonBuffer_(&memoryPool),
         otherValuesBuffer_(&memoryPool) {}
 
@@ -78,47 +80,54 @@ class MainlyConstantEncodingBase
     otherValues_->reset();
   }
 
-  void skip(uint32_t rowCount) final {
-    isCommonBuffer_.resize(rowCount);
-    isCommon_->materialize(rowCount, isCommonBuffer_.data());
-    const uint32_t commonCount =
-        std::accumulate(isCommonBuffer_.begin(), isCommonBuffer_.end(), 0U);
-    const uint32_t nonCommonCount = rowCount - commonCount;
+  void skip(uint32_t rowCount) override {
+    // Use bit-packed booleans for efficient SIMD counting.
+    const auto numWords = velox::bits::nwords(rowCount);
+
+    isCommonBuffer_.resize(numWords * sizeof(uint64_t));
+
+    auto* isCommon = reinterpret_cast<uint64_t*>(isCommonBuffer_.data());
+    // isCommon_ is used to encode bool stream so
+    // materializeBoolsAsBits is always implemented
+    isCommon_->materializeBoolsAsBits(rowCount, isCommon, 0);
+
+    const uint32_t nonCommonCount =
+        rowCount - velox::bits::countBits(isCommon, 0, rowCount);
+
     if (nonCommonCount == 0) {
       return;
     }
-
     otherValues_->skip(nonCommonCount);
   }
 
-  void materialize(uint32_t rowCount, void* buffer) final {
-    isCommonBuffer_.resize(rowCount);
-    isCommon_->materialize(rowCount, isCommonBuffer_.data());
-    const uint32_t commonCount =
-        std::accumulate(isCommonBuffer_.begin(), isCommonBuffer_.end(), 0U);
-    const uint32_t nonCommonCount = rowCount - commonCount;
+  void materialize(uint32_t rowCount, void* buffer) override {
+    // Use bit-packed booleans for efficient counting and iteration.
+    const auto numWords = velox::bits::nwords(rowCount);
+    isCommonBuffer_.resize(numWords * sizeof(uint64_t));
+    auto* isCommon = reinterpret_cast<uint64_t*>(isCommonBuffer_.data());
+    isCommon_->materializeBoolsAsBits(rowCount, isCommon, 0);
+
+    const uint32_t nonCommonCount =
+        rowCount - velox::bits::countBits(isCommon, 0, rowCount);
+
+    physicalType* output = static_cast<physicalType*>(buffer);
+    velox::simd::simdFill(output, commonValue_, rowCount);
 
     if (nonCommonCount == 0) {
-      physicalType* output = static_cast<physicalType*>(buffer);
-      std::fill(output, output + rowCount, commonValue_);
       return;
     }
 
     otherValuesBuffer_.reserve(nonCommonCount);
     otherValues_->materialize(nonCommonCount, otherValuesBuffer_.data());
-    physicalType* output = static_cast<physicalType*>(buffer);
-    const physicalType* nextOtherValue = otherValuesBuffer_.begin();
-    for (uint32_t i = 0; i < rowCount; ++i) {
-      if (isCommonBuffer_[i]) {
-        *output++ = commonValue_;
-      } else {
-        *output++ = *nextOtherValue++;
-      }
-    }
-    NIMBLE_DCHECK_EQ(
-        nextOtherValue - otherValuesBuffer_.begin(),
-        nonCommonCount,
-        "Encoding size mismatch.");
+
+    uint32_t otherIdx = 0;
+
+    // Fill with commonValue then scatter non-common values into the
+    // correct positions.
+    velox::bits::forEachUnsetBit(isCommon, 0, rowCount, [&](vector_size_t i) {
+      output[i] = otherValuesBuffer_[otherIdx++];
+    });
+    NIMBLE_CHECK_EQ(otherIdx, nonCommonCount, "Encoding size mismatch.");
   }
 
   template <typename DecoderVisitor>
@@ -164,7 +173,7 @@ class MainlyConstantEncodingBase
       values = detail::mutableValues<ValueType>(visitor, numRows);
       if (commonPassed) {
         auto commonValue = detail::dataToValue(visitor, commonData);
-        std::fill(values, values + numRows, commonValue);
+        velox::simd::simdFill(values, commonValue, numRows);
       }
     }
     const auto numIsCommon =
@@ -309,12 +318,14 @@ class MainlyConstantEncoding final : public MainlyConstantEncodingBase<T> {
   MainlyConstantEncoding(
       velox::memory::MemoryPool& memoryPool,
       std::string_view data,
-      std::function<void*(uint32_t)> stringBufferFactory);
+      std::function<void*(uint32_t)> stringBufferFactory,
+      const Encoding::Options& options = {});
 
   static std::string_view encode(
       EncodingSelection<physicalType>& selection,
       std::span<const physicalType> values,
-      Buffer& buffer);
+      Buffer& buffer,
+      const Encoding::Options& options = {});
 };
 
 //
@@ -325,16 +336,17 @@ template <typename T>
 MainlyConstantEncoding<T>::MainlyConstantEncoding(
     velox::memory::MemoryPool& memoryPool,
     std::string_view data,
-    std::function<void*(uint32_t)> stringBufferFactory)
-    : MainlyConstantEncodingBase<T>(memoryPool, data) {
-  const char* pos = data.data() + Encoding::kPrefixSize;
+    std::function<void*(uint32_t)> stringBufferFactory,
+    const Encoding::Options& options)
+    : MainlyConstantEncodingBase<T>(memoryPool, data, options) {
+  const char* pos = data.data() + this->dataOffset();
   const uint32_t isCommonBytes = encoding::readUint32(pos);
   this->isCommon_ = EncodingFactory::decode(
-      *this->pool_, {pos, isCommonBytes}, stringBufferFactory);
+      *this->pool_, {pos, isCommonBytes}, stringBufferFactory, options);
   pos += isCommonBytes;
   const uint32_t otherValuesBytes = encoding::readUint32(pos);
   this->otherValues_ = EncodingFactory::decode(
-      *this->pool_, {pos, otherValuesBytes}, stringBufferFactory);
+      *this->pool_, {pos, otherValuesBytes}, stringBufferFactory, options);
   pos += otherValuesBytes;
   this->commonValue_ = encoding::read<physicalType>(pos);
   NIMBLE_CHECK(pos == data.end(), "Unexpected mainly constant encoding end");
@@ -346,7 +358,9 @@ template <typename T>
 std::string_view MainlyConstantEncoding<T>::encode(
     EncodingSelection<physicalType>& selection,
     std::span<const physicalType> values,
-    Buffer& buffer) {
+    Buffer& buffer,
+    const Encoding::Options& options) {
+  const bool useVarint = options.useVarintRowCount;
   if (values.empty()) {
     NIMBLE_INCOMPATIBLE_ENCODING("MainlyConstantEncoding cannot be empty.");
   }
@@ -374,15 +388,19 @@ std::string_view MainlyConstantEncoding<T>::encode(
 
   Buffer tempBuffer{buffer.getMemoryPool()};
   std::string_view serializedIsCommon = selection.template encodeNested<bool>(
-      EncodingIdentifiers::MainlyConstant::IsCommon, isCommon, tempBuffer);
+      EncodingIdentifiers::MainlyConstant::IsCommon,
+      isCommon,
+      tempBuffer,
+      options);
   std::string_view serializedOtherValues =
       selection.template encodeNested<physicalType>(
           EncodingIdentifiers::MainlyConstant::OtherValues,
           otherValues,
-          tempBuffer);
+          tempBuffer,
+          options);
 
-  uint32_t encodingSize = Encoding::kPrefixSize + 8 +
-      serializedIsCommon.size() + serializedOtherValues.size();
+  uint32_t encodingSize = Encoding::serializePrefixSize(entryCount, useVarint) +
+      8 + serializedIsCommon.size() + serializedOtherValues.size();
   if constexpr (isNumericType<physicalType>()) {
     encodingSize += sizeof(physicalType);
   } else {
@@ -391,7 +409,11 @@ std::string_view MainlyConstantEncoding<T>::encode(
   char* reserved = buffer.reserve(encodingSize);
   char* pos = reserved;
   Encoding::serializePrefix(
-      EncodingType::MainlyConstant, TypeTraits<T>::dataType, entryCount, pos);
+      EncodingType::MainlyConstant,
+      TypeTraits<T>::dataType,
+      entryCount,
+      useVarint,
+      pos);
   // TODO: Reorder these so that metadata is at the beginning.
   encoding::writeString(serializedIsCommon, pos);
   encoding::writeString(serializedOtherValues, pos);
@@ -410,11 +432,13 @@ class MainlyConstantEncoding<std::string_view> final
   MainlyConstantEncoding(
       velox::memory::MemoryPool& memoryPool,
       std::string_view data,
-      std::function<void*(uint32_t)> stringBufferFactory);
+      std::function<void*(uint32_t)> stringBufferFactory,
+      const Encoding::Options& options = {});
 
   static std::string_view encode(
       EncodingSelection<physicalType>& selection,
       std::span<const physicalType> values,
-      Buffer& buffer);
+      Buffer& buffer,
+      const Encoding::Options& options = {});
 };
 } // namespace facebook::nimble

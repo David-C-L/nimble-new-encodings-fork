@@ -17,7 +17,7 @@
 #pragma once
 
 #include "dwio/nimble/encodings/EncodingUtils.h"
-#include "dwio/nimble/index/StripeIndexGroup.h"
+#include "dwio/nimble/index/ChunkIndexGroup.h"
 #include "dwio/nimble/velox/selective/NimbleData.h"
 #include "velox/dwio/common/SeekableInputStream.h"
 
@@ -146,7 +146,8 @@ class ChunkedDecoder {
         return;
       }
 
-      bits::Bitmap scatterBitmap{incomingNulls, static_cast<uint32_t>(count)};
+      velox::bits::Bitmap scatterBitmap{
+          incomingNulls, static_cast<uint32_t>(count)};
       // These are subranges in the scatter bit map for each materialize
       // call.
       uint32_t offset{0};
@@ -157,12 +158,12 @@ class ChunkedDecoder {
         }
 
         const auto numValues = std::min(totalNumValues - i, remainingValues_);
-        endOffset = bits::findSetBit(
+        endOffset = velox::bits::findSetBit(
             static_cast<const char*>(scatterBitmap.bits()),
             offset,
             scatterBitmap.size(),
             numValues + 1);
-        bits::Bitmap localBitmap{scatterBitmap.bits(), endOffset};
+        velox::bits::Bitmap localBitmap{scatterBitmap.bits(), endOffset};
         auto nonNullCount = encoding_->materializeNullable(
             numValues, data, [&]() { return nulls; }, &localBitmap, offset);
         if (nulls && nonNullCount == endOffset - offset) {
@@ -295,11 +296,12 @@ class ChunkedDecoder {
       numNonNulls =
           std::min<int64_t>(end - params.numScanned, remainingValues_);
     }
-    auto i = visitor.rowIndex();
-    while (i < numRows && visitor.rowAt(i) < chunkEnd) {
-      ++i;
-    }
-    return i;
+
+    return std::lower_bound(
+               visitor.rows() + visitor.rowIndex(),
+               visitor.rows() + numRows,
+               chunkEnd) -
+        visitor.rows();
   }
 
   template <bool kHasNulls, typename V>
@@ -382,6 +384,16 @@ class ChunkedDecoder {
   void loadNextChunk();
 
   void prepareInputBuffer(int32_t size);
+
+  // Returns true if inputData_ points into inputBuffer_.
+  bool fromInputBuffer() const {
+    if (!inputBuffer_) {
+      return false;
+    }
+    const char* bufStart = inputBuffer_->as<char>();
+    return inputData_ >= bufStart &&
+        inputData_ < bufStart + inputBuffer_->capacity();
+  }
 
   // Seek to a specific chunk by offset.
   // Positions the decoder at the beginning of the chunk at the given offset.

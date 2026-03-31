@@ -15,6 +15,8 @@
  */
 
 #include "dwio/nimble/velox/selective/SelectiveNimbleReader.h"
+
+#include "dwio/nimble/common/tests/GTestUtils.h"
 #include "dwio/nimble/common/tests/NimbleFileWriter.h"
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/dwio/common/TypeUtils.h"
@@ -1062,6 +1064,174 @@ TEST_P(SelectiveNimbleReaderTest, arrayWithOffsetsLastRunResize) {
       {{{1}}, {{1}}, std::vector<std::optional<int64_t>>{}, std::vector<std::optional<int64_t>>{}}, {}, {1, 2, 1}, passStringBuffersFromDecoder);
 }
 
+// Exercises the dense fast path in makeNestedRowSet and setAlphabet: all rows
+// are selected, selectedIndices_ is dense, and nestedRows_ is built via iota.
+TEST_P(SelectiveNimbleReaderTest, arrayWithOffsetsDenseAllSelected) {
+  const bool passStringBuffersFromDecoder = GetParam();
+  checkArrayWithOffsets(
+      {{{1, 2}}, {{3, 4}}, {{5, 6}}, {{7, 8}}},
+      {},
+      {4},
+      passStringBuffersFromDecoder);
+}
+
+// Dense path across multiple batches: nestedRows built via iota on each batch.
+TEST_P(SelectiveNimbleReaderTest, arrayWithOffsetsDenseMultiBatch) {
+  const bool passStringBuffersFromDecoder = GetParam();
+  checkArrayWithOffsets(
+      {{{1}}, {{2}}, {{3}}, {{4}}, {{5}}, {{6}}},
+      {},
+      {2, 2, 2},
+      passStringBuffersFromDecoder);
+}
+
+// Dense path with nulls interspersed: nulls are not part of the alphabet, so
+// selectedIndices_ remains dense for the non-null entries.
+TEST_P(SelectiveNimbleReaderTest, arrayWithOffsetsDenseWithNulls) {
+  const bool passStringBuffersFromDecoder = GetParam();
+  checkArrayWithOffsets(
+      {{{1, 2}}, std::nullopt, {{3, 4}}, std::nullopt, {{5, 6}}},
+      {},
+      {5},
+      passStringBuffersFromDecoder);
+}
+
+// Dense path with empty arrays: empty arrays still occupy alphabet entries.
+TEST_P(SelectiveNimbleReaderTest, arrayWithOffsetsDenseWithEmpties) {
+  const bool passStringBuffersFromDecoder = GetParam();
+  checkArrayWithOffsets(
+    {
+      std::optional<std::vector<std::optional<int64_t>>>{
+        std::vector<std::optional<int64_t>>{}},
+      std::optional<std::vector<std::optional<int64_t>>>{
+        std::vector<std::optional<int64_t>>{1}},
+      std::optional<std::vector<std::optional<int64_t>>>{
+        std::vector<std::optional<int64_t>>{}},
+      std::optional<std::vector<std::optional<int64_t>>>{
+        std::vector<std::optional<int64_t>>{2}},
+      std::optional<std::vector<std::optional<int64_t>>>{
+        std::vector<std::optional<int64_t>>{}},
+    },
+    {},
+    {5},
+    passStringBuffersFromDecoder);
+}
+
+// When subfield pruning is enabled, the dense fast path in makeNestedRowSet is
+// disabled (nestedRowsAllSelected is false), exercising the non-dense path even
+// though all rows are selected.
+TEST_P(SelectiveNimbleReaderTest, arrayWithOffsetsDenseWithSubfieldPruning) {
+  const bool passStringBuffersFromDecoder = GetParam();
+  checkArrayWithOffsets(
+      {{{1, 2, 3}}, {{4, 5, 6}}, {{7, 8, 9}}},
+      {},
+      {3},
+      passStringBuffersFromDecoder,
+      2);
+}
+
+// Filter drops first rows, making selectedIndices_ sparse.  Exercises the
+// non-dense (original) path in both makeNestedRowSet and setAlphabet, as a
+// contrast to the dense cases above.
+TEST_P(SelectiveNimbleReaderTest, arrayWithOffsetsSparseFilter) {
+  const bool passStringBuffersFromDecoder = GetParam();
+  checkArrayWithOffsets(
+      {{{1, 2}}, {{3, 4}}, {{5, 6}}, {{7, 8}}},
+      {false, true, false, true},
+      {2, 2},
+      passStringBuffersFromDecoder);
+}
+
+// --- Batch boundary interaction tests for the dense fast path ---
+// These tests exercise the interplay between startFromLastRun_, loadLastRun_,
+// copyLastRun_, and skipLastRun across batch boundaries, ensuring the dense
+// iota path produces correct results.
+
+// Run continuation across batches: the same deduplicated array value appears at
+// the end of batch 1 and start of batch 2, triggering startFromLastRun_=true
+// and copyLastRun_=true in batch 2.
+TEST_P(SelectiveNimbleReaderTest, arrayWithOffsetsDenseContinuedRun) {
+  const bool passStringBuffersFromDecoder = GetParam();
+  checkArrayWithOffsets(
+      {{{1, 2}}, {{1, 2}}, {{3, 4}}, {{3, 4}}},
+      {},
+      {2, 2},
+      passStringBuffersFromDecoder);
+}
+
+// Single-row batches through a dense deduplicated sequence: every batch
+// boundary triggers the last-run cache. Forces copyLastRun_ or skipLastRun
+// transitions on every read.
+TEST_P(SelectiveNimbleReaderTest, arrayWithOffsetsDenseSingleRowBatches) {
+  const bool passStringBuffersFromDecoder = GetParam();
+  checkArrayWithOffsets(
+      {{{1}}, {{2}}, {{3}}, {{4}}, {{5}}},
+      {},
+      {1, 1, 1, 1, 1},
+      passStringBuffersFromDecoder);
+}
+
+// Single-row batches with duplicate values: adjacent rows share the same
+// alphabet entry, so the run spans batch boundaries repeatedly.
+TEST_P(SelectiveNimbleReaderTest, arrayWithOffsetsDenseSingleRowDuplicates) {
+  const bool passStringBuffersFromDecoder = GetParam();
+  checkArrayWithOffsets(
+      {{{1}}, {{1}}, {{2}}, {{2}}, {{3}}, {{3}}},
+      {},
+      {1, 1, 1, 1, 1, 1},
+      passStringBuffersFromDecoder);
+}
+
+// Last run unloaded then new run: batch 1 reads row 0, the alphabet has
+// entries for rows 0 and 1 but row 1 exceeds the batch's maxRow, so
+// loadLastRun_ is set to false. Batch 2 starts a different run
+// (startFromLastRun_=false), so skipLastRun=true, disabling the dense path.
+// Batch 3 continues normally. This tests the transition through skipLastRun.
+TEST_P(SelectiveNimbleReaderTest, arrayWithOffsetsDenseSkipLastRunTransition) {
+  const bool passStringBuffersFromDecoder = GetParam();
+  checkArrayWithOffsets(
+      {{{1, 2}}, {{3, 4}}, {{5, 6}}, {{7, 8}}, {{9, 10}}},
+      {},
+      {1, 1, 1, 1, 1},
+      passStringBuffersFromDecoder);
+}
+
+// Uneven batch sizes splitting deduplicated runs at different points. Tests
+// that the dense path and last-run cache interact correctly when batches are
+// of varying sizes.
+TEST_P(SelectiveNimbleReaderTest, arrayWithOffsetsDenseUnevenBatches) {
+  const bool passStringBuffersFromDecoder = GetParam();
+  checkArrayWithOffsets(
+      {{{1}}, {{2}}, {{2}}, {{3}}, {{3}}, {{3}}, {{4}}},
+      {},
+      {1, 3, 2, 1},
+      passStringBuffersFromDecoder);
+}
+
+// Null at batch boundary: batch 1 ends with a non-null, batch 2 starts with
+// a null. Nulls are not in the alphabet, so this tests that the dense path
+// handles the boundary when the alphabet is smaller than the row count.
+TEST_P(SelectiveNimbleReaderTest, arrayWithOffsetsDenseNullAtBatchBoundary) {
+  const bool passStringBuffersFromDecoder = GetParam();
+  checkArrayWithOffsets(
+      {{{1}}, {{2}}, std::nullopt, {{3}}, {{4}}},
+      {},
+      {2, 1, 2},
+      passStringBuffersFromDecoder);
+}
+
+// Dense multi-element arrays with run continuation: tests that offsets and
+// sizes are computed correctly in setAlphabet when a multi-element array run
+// spans a batch boundary.
+TEST_P(SelectiveNimbleReaderTest, arrayWithOffsetsDenseMultiElementContinued) {
+  const bool passStringBuffersFromDecoder = GetParam();
+  checkArrayWithOffsets(
+      {{{1, 2, 3}}, {{1, 2, 3}}, {{4, 5}}, {{4, 5}}, {{6, 7, 8, 9}}},
+      {},
+      {2, 2, 1},
+      passStringBuffersFromDecoder);
+}
+
 TEST_P(SelectiveNimbleReaderTest, arrayWithOffsetsCopyLastRunAfterSkip) {
   const bool passStringBuffersFromDecoder = GetParam();
   checkArrayWithOffsets(
@@ -1215,6 +1385,70 @@ TEST_P(SelectiveNimbleReaderTest, slidingWindowMapLengthDedup) {
       {},
       nullptr,
       {3, 1, 1},
+      passStringBuffersFromDecoder);
+}
+
+// Dense path for deduplicated maps: all rows selected, no filter, single batch.
+TEST_P(SelectiveNimbleReaderTest, slidingWindowMapDenseAllSelected) {
+  const bool passStringBuffersFromDecoder = GetParam();
+  checkSlidingWindowMap(
+      {
+          {{{1, {10}}, {2, {20}}}},
+          {{{3, {30}}}},
+          {{{4, {40}}, {5, {50}}}},
+      },
+      {},
+      nullptr,
+      {3},
+      passStringBuffersFromDecoder);
+}
+
+// Dense path for deduplicated maps across multiple batches.
+TEST_P(SelectiveNimbleReaderTest, slidingWindowMapDenseMultiBatch) {
+  const bool passStringBuffersFromDecoder = GetParam();
+  checkSlidingWindowMap(
+      {
+          {{{1, {10}}}},
+          {{{2, {20}}}},
+          {{{3, {30}}}},
+          {{{4, {40}}}},
+      },
+      {},
+      nullptr,
+      {2, 2},
+      passStringBuffersFromDecoder);
+}
+
+// Dense path with nulls: selectedIndices_ stays dense for non-null entries.
+TEST_P(SelectiveNimbleReaderTest, slidingWindowMapDenseWithNulls) {
+  const bool passStringBuffersFromDecoder = GetParam();
+  checkSlidingWindowMap(
+      {
+          {{{1, {10}}}},
+          std::nullopt,
+          {{{2, {20}}}},
+          std::nullopt,
+          {{{3, {30}}}},
+      },
+      {},
+      nullptr,
+      {5},
+      passStringBuffersFromDecoder);
+}
+
+// Sparse filter on deduplicated maps: exercises the non-dense fallback.
+TEST_P(SelectiveNimbleReaderTest, slidingWindowMapSparseFilter) {
+  const bool passStringBuffersFromDecoder = GetParam();
+  checkSlidingWindowMap(
+      {
+          {{{1, {10}}}},
+          {{{2, {20}}}},
+          {{{3, {30}}}},
+          {{{4, {40}}}},
+      },
+      {true, false, true, false},
+      nullptr,
+      {2, 2},
       passStringBuffersFromDecoder);
 }
 
@@ -1545,7 +1779,7 @@ TEST_P(SelectiveNimbleReaderTest, nativeFlatMap) {
             3,
             makeFlatVector<int32_t>({4, 5, 6, 7, 8, 9}))));
 
-    VELOX_ASSERT_THROW(
+    NIMBLE_ASSERT_THROW(
         testRoundtrip(constructFlatMap(
             BaseVector::wrapInDictionary(
                 nullptr,
@@ -1557,7 +1791,7 @@ TEST_P(SelectiveNimbleReaderTest, nativeFlatMap) {
 
   // Constant wrapped keys
   {
-    VELOX_ASSERT_THROW(
+    NIMBLE_ASSERT_THROW(
         testRoundtrip(constructFlatMap(
             BaseVector::wrapInConstant(
                 3, 0, makeFlatVector<int32_t>({1, 2, 3})))),
@@ -1689,10 +1923,199 @@ TEST_P(SelectiveNimbleReaderTest, mapAsStructAllNulls) {
   velox::test::assertEqualVectors(expected, batch);
 }
 
+TEST_P(SelectiveNimbleReaderTest, columnDecodeMetrics) {
+  const bool passStringBuffersFromDecoder = GetParam();
+  const int numRows = 10'000;
+  auto input = makeRowVector({
+      makeFlatVector<int64_t>(numRows, [](auto i) { return i; }),
+      makeFlatVector<std::string>(
+          numRows, [](auto i) { return std::to_string(i); }),
+  });
+  auto scanSpec = std::make_shared<common::ScanSpec>("root");
+  scanSpec->addAllChildFields(*asRowType(input->type()));
+  auto file = test::createNimbleFile(*rootPool(), input);
+  auto readFile = std::make_shared<InMemoryReadFile>(file);
+  auto factory =
+      dwio::common::getReaderFactory(dwio::common::FileFormat::NIMBLE);
+  dwio::common::ReaderOptions options(pool());
+  options.setScanSpec(scanSpec);
+  auto reader = factory->createReader(
+      std::make_unique<dwio::common::BufferedInput>(readFile, *pool()),
+      options);
+  dwio::common::RowReaderOptions rowOptions;
+  rowOptions.setScanSpec(scanSpec);
+  rowOptions.setRequestedType(asRowType(input->type()));
+  rowOptions.setPassStringBuffersFromDecoder(passStringBuffersFromDecoder);
+  rowOptions.setCollectColumnStats(true);
+  rowOptions.setEagerFirstStripeLoad(true);
+  auto rowReader = reader->createRowReader(rowOptions);
+
+  VectorPtr result = BaseVector::create(asRowType(input->type()), 0, pool());
+  uint64_t totalRows = 0;
+  while (auto n = rowReader->next(1'000, result)) {
+    totalRows += n;
+    // Force materialization of lazy child vectors so that readWithTiming()
+    // is invoked on the leaf column readers.
+    auto* row = result->as<RowVector>();
+    for (auto i = 0; i < row->childrenSize(); ++i) {
+      row->childAt(i)->loadedVector();
+    }
+  }
+  EXPECT_EQ(totalRows, numRows) << "should read all rows";
+
+  dwio::common::RuntimeStatistics stats;
+  rowReader->updateRuntimeStats(stats);
+  ASSERT_TRUE(stats.columnReaderStats.columnMetricsSet.has_value());
+
+  // Directly check if column 1 has decode metrics
+  auto* col1 = stats.columnReaderStats.columnMetricsSet->getOrCreate(1);
+  EXPECT_GT(col1->decodeCPUTimeNanos.count(), 0)
+      << "column 1 decode count should be > 0";
+  auto* col2 = stats.columnReaderStats.columnMetricsSet->getOrCreate(2);
+  EXPECT_GT(col2->decodeCPUTimeNanos.count(), 0)
+      << "column 2 decode count should be > 0";
+}
+
 INSTANTIATE_TEST_CASE_P(
     SelectiveNimbleReaderTestSuite,
     SelectiveNimbleReaderTest,
     testing::Values(false, true));
+
+// Tests for FixedBitWidthEncoding fast path.
+// The fast path is used for 4-byte integral types without filters or hooks.
+
+TEST_P(SelectiveNimbleReaderTest, fixedBitWidthFastPathSameType) {
+  // Tests that the fast path works correctly for same-type reads (int32 →
+  // int32). This exercises the memcpy branch in bulkScan.
+  const bool passStringBuffersFromDecoder = GetParam();
+  for (bool hasNulls : {false, true}) {
+    SCOPED_TRACE(fmt::format("hasNulls={}", hasNulls));
+    auto data = makeFlatVector<int32_t>(
+        1000, [](auto i) { return i * 7; }, hasNulls ? nullEvery(17) : nullptr);
+    auto input = makeRowVector({data});
+    auto file = test::createNimbleFile(*rootPool(), input);
+    auto scanSpec = std::make_shared<common::ScanSpec>("root");
+    scanSpec->addAllChildFields(*input->type());
+    auto readers =
+        makeReaders(input, file, scanSpec, passStringBuffersFromDecoder);
+    // Read in a single large batch to exercise the dense fast path.
+    validate(*input, *readers.rowReader, 1000, -1, [](auto) { return true; });
+  }
+}
+
+TEST_P(SelectiveNimbleReaderTest, fixedBitWidthFastPathUpcast) {
+  // Tests that the fast path works correctly for upcast reads (int32 →
+  // int64). This exercises the upcast loop branch in bulkScan.
+  const bool passStringBuffersFromDecoder = GetParam();
+  for (bool hasNulls : {false, true}) {
+    SCOPED_TRACE(fmt::format("hasNulls={}", hasNulls));
+    // Write as int32.
+    auto writeData = makeFlatVector<int32_t>(
+        1000, [](auto i) { return i * 7; }, hasNulls ? nullEvery(17) : nullptr);
+    auto input = makeRowVector({writeData});
+    auto file = test::createNimbleFile(*rootPool(), input);
+
+    // Read as int64 (schema evolution / upcast).
+    auto readData = makeFlatVector<int64_t>(
+        1000, [](auto i) { return i * 7; }, hasNulls ? nullEvery(17) : nullptr);
+    auto expected = makeRowVector({readData});
+    auto scanSpec = std::make_shared<common::ScanSpec>("root");
+    scanSpec->addAllChildFields(*expected->type());
+    auto readers =
+        makeReaders(expected, file, scanSpec, passStringBuffersFromDecoder);
+    // Read in a single large batch to exercise the dense fast path.
+    validate(
+        *expected, *readers.rowReader, 1000, -1, [](auto) { return true; });
+  }
+}
+
+TEST_P(SelectiveNimbleReaderTest, fixedBitWidthFastPathMultipleBatches) {
+  // Tests that the fast path works correctly with multiple batches.
+  // This exercises the row tracking and position management.
+  const bool passStringBuffersFromDecoder = GetParam();
+  for (bool hasNulls : {false, true}) {
+    SCOPED_TRACE(fmt::format("hasNulls={}", hasNulls));
+    auto data = makeFlatVector<int32_t>(
+        500,
+        [](auto i) { return i * 3 + 1; },
+        hasNulls ? nullEvery(11) : nullptr);
+    auto input = makeRowVector({data});
+    auto file = test::createNimbleFile(*rootPool(), input);
+    auto scanSpec = std::make_shared<common::ScanSpec>("root");
+    scanSpec->addAllChildFields(*input->type());
+    auto readers =
+        makeReaders(input, file, scanSpec, passStringBuffersFromDecoder);
+    // Read in small batches to test batch boundary handling.
+    validate(*input, *readers.rowReader, 37, -1, [](auto) { return true; });
+  }
+}
+
+TEST_P(SelectiveNimbleReaderTest, fixedBitWidthFastPathLargeValues) {
+  // Tests that the fast path handles large values correctly.
+  // This verifies baseline handling in the encoding.
+  const bool passStringBuffersFromDecoder = GetParam();
+  for (bool hasNulls : {false, true}) {
+    SCOPED_TRACE(fmt::format("hasNulls={}", hasNulls));
+    auto data = makeFlatVector<int32_t>(
+        200,
+        [](auto i) { return static_cast<int32_t>(1'000'000'000 + i * 100); },
+        hasNulls ? nullEvery(13) : nullptr);
+    auto input = makeRowVector({data});
+    auto file = test::createNimbleFile(*rootPool(), input);
+    auto scanSpec = std::make_shared<common::ScanSpec>("root");
+    scanSpec->addAllChildFields(*input->type());
+    auto readers =
+        makeReaders(input, file, scanSpec, passStringBuffersFromDecoder);
+    validate(*input, *readers.rowReader, 200, -1, [](auto) { return true; });
+  }
+}
+
+TEST_P(SelectiveNimbleReaderTest, fixedBitWidthFastPathNegativeValues) {
+  // Tests that the fast path handles negative values correctly.
+  const bool passStringBuffersFromDecoder = GetParam();
+  for (bool hasNulls : {false, true}) {
+    SCOPED_TRACE(fmt::format("hasNulls={}", hasNulls));
+    auto data = makeFlatVector<int32_t>(
+        300,
+        [](auto i) { return static_cast<int32_t>(i) - 150; },
+        hasNulls ? nullEvery(19) : nullptr);
+    auto input = makeRowVector({data});
+    auto file = test::createNimbleFile(*rootPool(), input);
+    auto scanSpec = std::make_shared<common::ScanSpec>("root");
+    scanSpec->addAllChildFields(*input->type());
+    auto readers =
+        makeReaders(input, file, scanSpec, passStringBuffersFromDecoder);
+    validate(*input, *readers.rowReader, 300, -1, [](auto) { return true; });
+  }
+}
+
+TEST_P(SelectiveNimbleReaderTest, fixedBitWidthFastPathUpcastNegative) {
+  // Tests that the fast path handles upcast with negative values correctly.
+  // This verifies sign extension works properly.
+  const bool passStringBuffersFromDecoder = GetParam();
+  for (bool hasNulls : {false, true}) {
+    SCOPED_TRACE(fmt::format("hasNulls={}", hasNulls));
+    // Write as int32.
+    auto writeData = makeFlatVector<int32_t>(
+        200,
+        [](auto i) { return static_cast<int32_t>(i) - 100; },
+        hasNulls ? nullEvery(11) : nullptr);
+    auto input = makeRowVector({writeData});
+    auto file = test::createNimbleFile(*rootPool(), input);
+
+    // Read as int64.
+    auto readData = makeFlatVector<int64_t>(
+        200,
+        [](auto i) { return static_cast<int64_t>(i) - 100; },
+        hasNulls ? nullEvery(11) : nullptr);
+    auto expected = makeRowVector({readData});
+    auto scanSpec = std::make_shared<common::ScanSpec>("root");
+    scanSpec->addAllChildFields(*expected->type());
+    auto readers =
+        makeReaders(expected, file, scanSpec, passStringBuffersFromDecoder);
+    validate(*expected, *readers.rowReader, 200, -1, [](auto) { return true; });
+  }
+}
 
 } // namespace
 } // namespace facebook::nimble

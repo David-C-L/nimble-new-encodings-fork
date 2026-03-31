@@ -249,8 +249,34 @@ class NullsAsDataStreamData : public StreamData {
 
 class WriterStreamContext : public StreamContext {
  public:
-  bool isNullStream = false;
-  const EncodingLayout* encoding;
+  bool isNullStream() const {
+    return isNullStream_;
+  }
+
+  void setIsNullStream(bool value) {
+    isNullStream_ = value;
+  }
+
+  bool isInMapStream() const {
+    return isInMapStream_;
+  }
+
+  void setIsInMapStream(bool value) {
+    isInMapStream_ = value;
+  }
+
+  const EncodingLayout* encoding() const {
+    return encoding_;
+  }
+
+  void setEncoding(const EncodingLayout* value) {
+    encoding_ = value;
+  }
+
+ private:
+  bool isNullStream_{false};
+  bool isInMapStream_{false};
+  const EncodingLayout* encoding_{nullptr};
 };
 
 class FlatmapEncodingLayoutContext : public TypeBuilderContext {
@@ -312,8 +338,8 @@ std::string_view encodeStreamTyped(
       streamData.descriptor().context<WriterStreamContext>();
 
   std::optional<EncodingLayout> encodingLayout;
-  if (streamContext && streamContext->encoding) {
-    encodingLayout.emplace(*streamContext->encoding);
+  if (streamContext && streamContext->encoding()) {
+    encodingLayout.emplace(*streamContext->encoding());
   }
 
   try {
@@ -379,10 +405,9 @@ void findNodeIds(
 WriterStreamContext& getStreamContext(
     const StreamDescriptorBuilder& descriptor) {
   auto* context = descriptor.context<WriterStreamContext>();
-  if (context) {
+  if (context != nullptr) {
     return *context;
   }
-
   descriptor.setContext(std::make_unique<WriterStreamContext>());
   return *descriptor.context<WriterStreamContext>();
 }
@@ -437,12 +462,12 @@ std::unique_ptr<FieldWriter> createRootFieldWriter(
   return FieldWriter::create(context, type, [&](const TypeBuilder& type) {
     switch (type.kind()) {
       case Kind::Row: {
-        getStreamContext(type.asRow().nullsDescriptor()).isNullStream = true;
+        getStreamContext(type.asRow().nullsDescriptor()).setIsNullStream(true);
         break;
       }
       case Kind::FlatMap: {
-        getStreamContext(type.asFlatMap().nullsDescriptor()).isNullStream =
-            true;
+        getStreamContext(type.asFlatMap().nullsDescriptor())
+            .setIsNullStream(true);
         break;
       }
       default:
@@ -451,16 +476,17 @@ std::unique_ptr<FieldWriter> createRootFieldWriter(
   });
 }
 
-std::optional<TabletIndexConfig> createTabletIndexConfig(
+std::optional<ClusterIndexConfig> createClusterIndexConfig(
     const std::optional<IndexConfig>& config,
     index::IndexWriter* indexWriter) {
   if (!config.has_value() || indexWriter == nullptr) {
     return std::nullopt;
   }
-  return TabletIndexConfig{
+  return ClusterIndexConfig{
       .columns = config->columns,
       .sortOrders = indexWriter->sortOrders(),
       .enforceKeyOrder = config->enforceKeyOrder,
+      .noDuplicateKey = config->noDuplicateKey,
   };
 }
 
@@ -468,11 +494,10 @@ void initializeEncodingLayouts(
     const TypeBuilder& typeBuilder,
     const EncodingLayoutTree& encodingLayoutTree) {
   {
-#define _SET_STREAM_CONTEXT(builder, descriptor, identifier)      \
-  if (auto* encodingLayout = encodingLayoutTree.encodingLayout(   \
-          EncodingLayoutTree::StreamIdentifiers::identifier)) {   \
-    auto& streamContext = getStreamContext(builder.descriptor()); \
-    streamContext.encoding = encodingLayout;                      \
+#define SET_STREAM_CONTEXT(builder, descriptor, identifier)             \
+  if (auto* encodingLayout = encodingLayoutTree.encodingLayout(         \
+          EncodingLayoutTree::StreamIdentifiers::identifier)) {         \
+    getStreamContext(builder.descriptor()).setEncoding(encodingLayout); \
   }
 
     if (typeBuilder.kind() == Kind::FlatMap) {
@@ -497,140 +522,141 @@ void initializeEncodingLayouts(
           std::make_unique<FlatmapEncodingLayoutContext>(
               std::move(keyEncodings)));
 
-      _SET_STREAM_CONTEXT(mapBuilder, nullsDescriptor, FlatMap::NullsStream);
-    } else {
-      switch (typeBuilder.kind()) {
-        case Kind::Scalar: {
-          NIMBLE_CHECK_EQ(
-              encodingLayoutTree.schemaKind(),
-              Kind::Scalar,
-              "Incompatible encoding layout node. Expecting scalar node.");
-          _SET_STREAM_CONTEXT(
-              typeBuilder.asScalar(), scalarDescriptor, Scalar::ScalarStream);
-          break;
-        }
-        case Kind::TimestampMicroNano: {
-          NIMBLE_CHECK_EQ(
-              encodingLayoutTree.schemaKind(),
-              Kind::TimestampMicroNano,
-              "Incompatible encoding layout node. Expecting TimestampMicroNano node but got {}.",
-              toString(encodingLayoutTree.schemaKind()));
-          auto& timestampMicroNanoBuilder = typeBuilder.asTimestampMicroNano();
-          _SET_STREAM_CONTEXT(
-              timestampMicroNanoBuilder,
-              microsDescriptor,
-              TimestampMicroNano::MicrosStream);
-          _SET_STREAM_CONTEXT(
-              timestampMicroNanoBuilder,
-              nanosDescriptor,
-              TimestampMicroNano::NanosStream);
-          break;
-        }
-        case Kind::Row: {
-          NIMBLE_CHECK_EQ(
-              encodingLayoutTree.schemaKind(),
-              Kind::Row,
-              "Incompatible encoding layout node. Expecting row node.");
-          auto& rowBuilder = typeBuilder.asRow();
-          _SET_STREAM_CONTEXT(rowBuilder, nullsDescriptor, Row::NullsStream);
-          for (auto i = 0; i < rowBuilder.childrenCount() &&
-               i < encodingLayoutTree.childrenCount();
-               ++i) {
-            initializeEncodingLayouts(
-                rowBuilder.childAt(i), encodingLayoutTree.child(i));
-          }
-          break;
-        }
-        case Kind::Array: {
-          NIMBLE_CHECK_EQ(
-              encodingLayoutTree.schemaKind(),
-              Kind::Array,
-              "Incompatible encoding layout node. Expecting array node.");
-          auto& arrayBuilder = typeBuilder.asArray();
-          _SET_STREAM_CONTEXT(
-              arrayBuilder, lengthsDescriptor, Array::LengthsStream);
-          if (encodingLayoutTree.childrenCount() > 0) {
-            NIMBLE_CHECK(
-                encodingLayoutTree.childrenCount() == 1,
-                "Invalid encoding layout tree. Array node should have exactly one child.");
-            initializeEncodingLayouts(
-                arrayBuilder.elements(), encodingLayoutTree.child(0));
-          }
-          break;
-        }
-        case Kind::Map: {
-          if (encodingLayoutTree.schemaKind() == Kind::FlatMap) {
-            // Schema evolution - If a flatmap is converted to map, we should
-            // not fail, but also not try to replay captured encodings.
-            return;
-          }
-          NIMBLE_CHECK_EQ(
-              encodingLayoutTree.schemaKind(),
-              Kind::Map,
-              "Incompatible encoding layout node. Expecting map node.");
-          auto& mapBuilder = typeBuilder.asMap();
+      SET_STREAM_CONTEXT(mapBuilder, nullsDescriptor, FlatMap::NullsStream);
+      return;
+    }
 
-          _SET_STREAM_CONTEXT(
-              mapBuilder, lengthsDescriptor, Map::LengthsStream);
-          if (encodingLayoutTree.childrenCount() > 0) {
-            NIMBLE_CHECK(
-                encodingLayoutTree.childrenCount() == 2,
-                "Invalid encoding layout tree. Map node should have exactly two children.");
-            initializeEncodingLayouts(
-                mapBuilder.keys(), encodingLayoutTree.child(0));
-            initializeEncodingLayouts(
-                mapBuilder.values(), encodingLayoutTree.child(1));
-          }
+    switch (typeBuilder.kind()) {
+      case Kind::Scalar: {
+        NIMBLE_CHECK_EQ(
+            encodingLayoutTree.schemaKind(),
+            Kind::Scalar,
+            "Incompatible encoding layout node. Expecting scalar node.");
+        SET_STREAM_CONTEXT(
+            typeBuilder.asScalar(), scalarDescriptor, Scalar::ScalarStream);
+        break;
+      }
+      case Kind::TimestampMicroNano: {
+        NIMBLE_CHECK_EQ(
+            encodingLayoutTree.schemaKind(),
+            Kind::TimestampMicroNano,
+            "Incompatible encoding layout node. Expecting TimestampMicroNano node but got {}.",
+            toString(encodingLayoutTree.schemaKind()));
+        auto& timestampMicroNanoBuilder = typeBuilder.asTimestampMicroNano();
+        SET_STREAM_CONTEXT(
+            timestampMicroNanoBuilder,
+            microsDescriptor,
+            TimestampMicroNano::MicrosStream);
+        SET_STREAM_CONTEXT(
+            timestampMicroNanoBuilder,
+            nanosDescriptor,
+            TimestampMicroNano::NanosStream);
+        break;
+      }
+      case Kind::Row: {
+        NIMBLE_CHECK_EQ(
+            encodingLayoutTree.schemaKind(),
+            Kind::Row,
+            "Incompatible encoding layout node. Expecting row node.");
+        auto& rowBuilder = typeBuilder.asRow();
+        SET_STREAM_CONTEXT(rowBuilder, nullsDescriptor, Row::NullsStream);
+        for (auto i = 0; i < rowBuilder.childrenCount() &&
+             i < encodingLayoutTree.childrenCount();
+             ++i) {
+          initializeEncodingLayouts(
+              rowBuilder.childAt(i), encodingLayoutTree.child(i));
+        }
+        break;
+      }
+      case Kind::Array: {
+        NIMBLE_CHECK_EQ(
+            encodingLayoutTree.schemaKind(),
+            Kind::Array,
+            "Incompatible encoding layout node. Expecting array node.");
+        auto& arrayBuilder = typeBuilder.asArray();
+        SET_STREAM_CONTEXT(
+            arrayBuilder, lengthsDescriptor, Array::LengthsStream);
+        if (encodingLayoutTree.childrenCount() > 0) {
+          NIMBLE_CHECK(
+              encodingLayoutTree.childrenCount() == 1,
+              "Invalid encoding layout tree. Array node should have exactly one child.");
+          initializeEncodingLayouts(
+              arrayBuilder.elements(), encodingLayoutTree.child(0));
+        }
+        break;
+      }
+      case Kind::Map: {
+        if (encodingLayoutTree.schemaKind() == Kind::FlatMap) {
+          // Schema evolution - If a flatmap is converted to map, we should
+          // not fail, but also not try to replay captured encodings.
+          return;
+        }
+        NIMBLE_CHECK_EQ(
+            encodingLayoutTree.schemaKind(),
+            Kind::Map,
+            "Incompatible encoding layout node. Expecting map node.");
+        auto& mapBuilder = typeBuilder.asMap();
 
-          break;
-        }
-        case Kind::SlidingWindowMap: {
+        SET_STREAM_CONTEXT(mapBuilder, lengthsDescriptor, Map::LengthsStream);
+        if (encodingLayoutTree.childrenCount() > 0) {
           NIMBLE_CHECK_EQ(
-              encodingLayoutTree.schemaKind(),
-              Kind::SlidingWindowMap,
-              "Incompatible encoding layout node. Expecting SlidingWindowMap node.");
-          auto& mapBuilder = typeBuilder.asSlidingWindowMap();
-          _SET_STREAM_CONTEXT(
-              mapBuilder, offsetsDescriptor, SlidingWindowMap::OffsetsStream);
-          _SET_STREAM_CONTEXT(
-              mapBuilder, lengthsDescriptor, SlidingWindowMap::LengthsStream);
-          if (encodingLayoutTree.childrenCount() > 0) {
-            NIMBLE_CHECK(
-                encodingLayoutTree.childrenCount() == 2,
-                "Invalid encoding layout tree. SlidingWindowMap node should have exactly two children.");
-            initializeEncodingLayouts(
-                mapBuilder.keys(), encodingLayoutTree.child(0));
-            initializeEncodingLayouts(
-                mapBuilder.values(), encodingLayoutTree.child(1));
-          }
+              encodingLayoutTree.childrenCount(),
+              2,
+              "Invalid encoding layout tree. Map node should have exactly two children.");
+          initializeEncodingLayouts(
+              mapBuilder.keys(), encodingLayoutTree.child(0));
+          initializeEncodingLayouts(
+              mapBuilder.values(), encodingLayoutTree.child(1));
+        }
 
-          break;
+        break;
+      }
+      case Kind::SlidingWindowMap: {
+        NIMBLE_CHECK_EQ(
+            encodingLayoutTree.schemaKind(),
+            Kind::SlidingWindowMap,
+            "Incompatible encoding layout node. Expecting SlidingWindowMap node.");
+        auto& mapBuilder = typeBuilder.asSlidingWindowMap();
+        SET_STREAM_CONTEXT(
+            mapBuilder, offsetsDescriptor, SlidingWindowMap::OffsetsStream);
+        SET_STREAM_CONTEXT(
+            mapBuilder, lengthsDescriptor, SlidingWindowMap::LengthsStream);
+        if (encodingLayoutTree.childrenCount() > 0) {
+          NIMBLE_CHECK(
+              encodingLayoutTree.childrenCount() == 2,
+              "Invalid encoding layout tree. SlidingWindowMap node should have exactly two children.");
+          initializeEncodingLayouts(
+              mapBuilder.keys(), encodingLayoutTree.child(0));
+          initializeEncodingLayouts(
+              mapBuilder.values(), encodingLayoutTree.child(1));
         }
-        case Kind::ArrayWithOffsets: {
-          NIMBLE_CHECK_EQ(
-              encodingLayoutTree.schemaKind(),
-              Kind::ArrayWithOffsets,
-              "Incompatible encoding layout node. Expecting offset array node.");
-          auto& arrayBuilder = typeBuilder.asArrayWithOffsets();
-          _SET_STREAM_CONTEXT(
-              arrayBuilder, offsetsDescriptor, ArrayWithOffsets::OffsetsStream);
-          _SET_STREAM_CONTEXT(
-              arrayBuilder, lengthsDescriptor, ArrayWithOffsets::LengthsStream);
-          if (encodingLayoutTree.childrenCount() > 0) {
-            NIMBLE_CHECK(
-                encodingLayoutTree.childrenCount() == 2,
-                "Invalid encoding layout tree. ArrayWithOffset node should have exactly two children.");
-            initializeEncodingLayouts(
-                arrayBuilder.elements(), encodingLayoutTree.child(0));
-          }
-          break;
+
+        break;
+      }
+      case Kind::ArrayWithOffsets: {
+        NIMBLE_CHECK_EQ(
+            encodingLayoutTree.schemaKind(),
+            Kind::ArrayWithOffsets,
+            "Incompatible encoding layout node. Expecting offset array node.");
+        auto& arrayBuilder = typeBuilder.asArrayWithOffsets();
+        SET_STREAM_CONTEXT(
+            arrayBuilder, offsetsDescriptor, ArrayWithOffsets::OffsetsStream);
+        SET_STREAM_CONTEXT(
+            arrayBuilder, lengthsDescriptor, ArrayWithOffsets::LengthsStream);
+        if (encodingLayoutTree.childrenCount() > 0) {
+          NIMBLE_CHECK(
+              encodingLayoutTree.childrenCount() == 2,
+              "Invalid encoding layout tree. ArrayWithOffset node should have exactly two children.");
+          initializeEncodingLayouts(
+              arrayBuilder.elements(), encodingLayoutTree.child(0));
         }
-        case Kind::FlatMap: {
-          NIMBLE_UNREACHABLE("Flatmap handled already");
-        }
+        break;
+      }
+      case Kind::FlatMap: {
+        NIMBLE_UNREACHABLE("Flatmap handled already");
       }
     }
-#undef _SET_STREAM_CONTEXT
+#undef SET_STREAM_CONTEXT
   }
 }
 } // namespace
@@ -676,24 +702,35 @@ VeloxWriter::VeloxWriter(
                    kMetadataCompressionThreshold),
            .streamDeduplicationEnabled =
                context_->options().enableStreamDeduplication,
-           .indexConfig = createTabletIndexConfig(
+           .enableChunkIndex = context_->options().enableChunkIndex,
+           .chunkIndexMinAvgChunks = context_->options().chunkIndexMinAvgChunks,
+           .indexConfig = createClusterIndexConfig(
                context_->options().indexConfig,
                indexWriter_.get())})} {
   NIMBLE_CHECK_NOT_NULL(file_);
 
+  context_->setFlatmapFieldAddedEventHandler([this](
+                                                 const TypeBuilder& flatmap,
+                                                 std::string_view fieldKey,
+                                                 const TypeBuilder& fieldType) {
+    // Mark the newly added child's in-map stream descriptor.
+    auto& flatmapBuilder = flatmap.asFlatMap();
+    getStreamContext(
+        flatmapBuilder.inMapDescriptorAt(flatmapBuilder.childrenCount() - 1))
+        .setIsInMapStream(true);
+
+    // Handle encoding layout if configured.
+    if (context_->options().encodingLayoutTree.has_value()) {
+      auto* ctx = flatmap.context<FlatmapEncodingLayoutContext>();
+      if (ctx != nullptr) {
+        auto it = ctx->keyEncodings.find(fieldKey);
+        if (it != ctx->keyEncodings.end()) {
+          initializeEncodingLayouts(fieldType, it->second);
+        }
+      }
+    }
+  });
   if (context_->options().encodingLayoutTree.has_value()) {
-    context_->setFlatmapFieldAddedEventHandler(
-        [&](const TypeBuilder& flatmap,
-            std::string_view fieldKey,
-            const TypeBuilder& fieldType) {
-          auto* context = flatmap.context<FlatmapEncodingLayoutContext>();
-          if (context) {
-            auto it = context->keyEncodings.find(fieldKey);
-            if (it != context->keyEncodings.end()) {
-              initializeEncodingLayouts(fieldType, it->second);
-            }
-          }
-        });
     initializeEncodingLayouts(
         *rootWriter_->typeBuilder(),
         context_->options().encodingLayoutTree.value());
@@ -710,18 +747,24 @@ bool VeloxWriter::write(const velox::VectorPtr& input) {
   NIMBLE_CHECK_NOT_NULL(file_, "Writer is already closed");
   try {
     const auto numRows = input->size();
-    // Calculate raw size using schema information to correctly handle
-    // passthrough flatmaps (ROW vectors written as MAP).
-    RawSizeContext context;
-    const auto rawSize = nimble::getRawSizeFromVector(
-        input,
-        velox::common::Ranges::of(0, numRows),
-        context,
-        *schema_,
-        context_->flatMapNodeIds(),
-        context_->ignoreTopLevelNulls());
-    NIMBLE_CHECK_GE(rawSize, 0, "Invalid raw size");
-    context_->updateFileRawSize(rawSize);
+    // When enableStatsConsistencyCheck is true, compute raw size using
+    // RawSizeUtils to verify consistency with column statistics.
+    // Otherwise, skip this computation as column statistics will provide
+    // the raw size.
+    if (context_->options().enableStatsConsistencyCheck) {
+      // Calculate raw size using schema information to correctly handle
+      // passthrough flatmaps.
+      RawSizeContext context;
+      const auto rawSize = nimble::getRawSizeFromVector(
+          input,
+          velox::common::Ranges::of(0, numRows),
+          context,
+          schema_.get(),
+          context_->flatMapNodeIds(),
+          context_->ignoreTopLevelNulls());
+      NIMBLE_CHECK_GE(rawSize, 0, "Invalid raw size");
+      context_->updateFileRawSize(rawSize);
+    }
 
     if (context_->options().writeExecutor) {
       velox::dwio::common::ExecutorBarrier barrier{
@@ -784,6 +827,15 @@ void VeloxWriter::writeMetadata() {
 }
 
 void VeloxWriter::writeColumnStats() {
+  // When enableStatsConsistencyCheck is true, verify that fileRawSize
+  // (accumulated via RawSizeUtils) matches the root column statistics.
+  if (context_->options().enableStatsConsistencyCheck) {
+    NIMBLE_CHECK_EQ(
+        context_->fileRawSize(),
+        context_->columnStats().front()->getLogicalSize(),
+        "Mismatched raw sizes!");
+  }
+
   if (context_->options().enableVectorizedStats) {
     VectorizedFileStats fileStats{
         context_->columnStats(), encodingMemoryPool_.get()};
@@ -808,14 +860,14 @@ void VeloxWriter::writeSchema() {
       serializer.serialize(context_->schemaBuilder()));
 }
 
-bool VeloxWriter::hasIndex() const {
+bool VeloxWriter::hasClusterIndex() const {
   return indexWriter_ != nullptr;
 }
 
 void VeloxWriter::addIndexKey(
     const velox::VectorPtr& input,
     velox::dwio::common::ExecutorBarrier* barrier) {
-  if (!hasIndex()) {
+  if (!hasClusterIndex()) {
     return;
   }
   ensureEncodingBuffer();
@@ -852,7 +904,7 @@ void VeloxWriter::close() {
       writeStripe();
       rootWriter_->close();
       context_->finalizeStatsCollectors();
-      if (hasIndex()) {
+      if (hasClusterIndex()) {
         indexWriter_->close();
       }
 
@@ -864,14 +916,14 @@ void VeloxWriter::close() {
       file_->close();
       context_->setBytesWritten(file_->size());
 
-      auto runStats = getRunStats();
+      auto stats = this->stats();
       // TODO: compute and populate input size.
       FileCloseMetrics metrics{
           .rowCount = context_->rowsInFile(),
           .stripeCount = context_->getStripeIndex(),
           .fileSize = context_->bytesWritten(),
-          .totalFlushCpuUsec = runStats.flushCpuTimeUsec,
-          .totalFlushWallTimeUsec = runStats.flushWallTimeUsec};
+          .totalFlushCpuUsec = stats.flushCpuTimeUs,
+          .totalFlushWallTimeUsec = stats.flushWallTimeUs};
       context_->logger()->logFileClose(metrics);
       file_ = nullptr;
     } catch (const std::exception& e) {
@@ -977,7 +1029,7 @@ void VeloxWriter::writeStreams() {
 }
 
 void VeloxWriter::encodeKeyStreamChunk(bool lastChunk, bool ensureFullChunks) {
-  NIMBLE_CHECK(hasIndex());
+  NIMBLE_CHECK(hasClusterIndex());
   if (!indexWriter_->hasKeys()) {
     return;
   }
@@ -1010,7 +1062,7 @@ void VeloxWriter::processStream(
   const auto offset = streamData.descriptor().offset();
   const auto* context = streamData.descriptor().context<WriterStreamContext>();
   NIMBLE_CHECK(encodedStreams_[offset].chunks.empty());
-  if ((context != nullptr) && context->isNullStream) {
+  if ((context != nullptr) && context->isNullStream()) {
     // For null streams we promote the null values to be written as
     // boolean data.
     // We still apply the same null logic, where if all values are
@@ -1018,6 +1070,22 @@ void VeloxWriter::processStream(
     if (streamData.hasNulls()) {
       NullsAsDataStreamData nullsStreamData{streamData};
       encodeStream(nullsStreamData, streamSize, chunkSize);
+    }
+  } else if (
+      (context != nullptr) && context->isInMapStream() &&
+      context_->options().skipConstantFlatMapInMapStreams) {
+    // When enabled, skip encoding in-map streams that are all-true (every row
+    // has the key) or all-false (no row has the key). The reader distinguishes
+    // these by checking value stream presence: all-true keys have value
+    // streams, all-false keys do not.
+    //
+    // NOTE: old readers that don't understand missing in-map streams will
+    // misinterpret data. This must stay behind the
+    // skipConstantFlatMapInMapStreams option until the new reader is fully
+    // rolled out.
+    streamData.materialize();
+    if (!isConstantBoolStream(streamData.data())) {
+      encodeStream(streamData, streamSize, chunkSize);
     }
   } else {
     streamData.materialize();
@@ -1029,7 +1097,7 @@ void VeloxWriter::processStream(
 
 void VeloxWriter::maybeProcessKeyStream(
     velox::dwio::common::ExecutorBarrier* barrier) {
-  if (!hasIndex()) {
+  if (!hasClusterIndex()) {
     return;
   }
   NIMBLE_CHECK(indexWriter_->hasKeys());
@@ -1045,7 +1113,7 @@ void VeloxWriter::maybeEncodeKeyStreamChunk(
     bool lastChunk,
     bool ensureFullChunks,
     velox::dwio::common::ExecutorBarrier* barrier) {
-  if (!hasIndex()) {
+  if (!hasClusterIndex()) {
     return;
   }
   auto encode = [&]() { encodeKeyStreamChunk(lastChunk, ensureFullChunks); };
@@ -1057,7 +1125,7 @@ void VeloxWriter::maybeEncodeKeyStreamChunk(
 }
 
 std::optional<KeyStream> VeloxWriter::finishKeyStream() {
-  if (!hasIndex()) {
+  if (!hasClusterIndex()) {
     return std::nullopt;
   }
   return indexWriter_->finishStripe(*encodingBuffer_);
@@ -1340,15 +1408,15 @@ bool VeloxWriter::evaluateFlushPolicy() {
   return false;
 }
 
-VeloxWriter::RunStats VeloxWriter::getRunStats() const {
-  return RunStats{
+VeloxWriter::Stats VeloxWriter::stats() const {
+  return Stats{
       .bytesWritten = context_->bytesWritten(),
       .stripeCount = folly::to<uint32_t>(context_->getStripeIndex()),
       .rawSize = context_->fileRawSize(),
       .rowsPerStripe = context_->rowsPerStripe(),
-      .flushCpuTimeUsec = context_->totalFlushTiming().cpuNanos / 1'000,
-      .flushWallTimeUsec = context_->totalFlushTiming().wallNanos / 1'000,
-      .encodingSelectionCpuTimeUsec =
+      .flushCpuTimeUs = context_->totalFlushTiming().cpuNanos / 1'000,
+      .flushWallTimeUs = context_->totalFlushTiming().wallNanos / 1'000,
+      .encodingSelectionCpuTimeUs =
           context_->encodingSelectionTiming().cpuNanos / 1'000,
       .inputBufferReallocCount = context_->inputBufferGrowthStats().count,
       .inputBufferReallocItemCount =

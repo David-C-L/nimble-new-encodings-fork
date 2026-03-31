@@ -45,12 +45,33 @@ struct VeloxWriterOptions {
   // Enable vectorized stats for applicable schema shapes.
   bool enableVectorizedStats{false};
 
+  // When true, chunk-level position index is built for all streams,
+  // enabling O(1) chunk-level seeking within stripes. Independent of
+  // the cluster index (indexConfig). When indexConfig is set, chunk
+  // index is always enabled regardless of this flag.
+  bool enableChunkIndex{false};
+
+  // Skip writing chunk index for a stripe group if the average number
+  // of chunks per stream is below this threshold. 0 disables chunk index
+  // skipping.
+  float chunkIndexMinAvgChunks{2};
+
   /// If set, the cluster index on the specified columns will be built during
   /// writing. The index stores the per-chunk min and max key for each stripe.
   std::optional<IndexConfig> indexConfig;
 
   // Columns that should be encoded as flat maps
   folly::F14FastSet<std::string> flatMapColumns;
+
+  // When true, the writer skips encoding flat map in-map boolean streams that
+  // are all-true (every row has the key) or all-false (no row has the key).
+  // The reader infers the in-map state from value stream presence: all-true
+  // keys have value streams, all-false keys do not.
+  //
+  // NOTE: old readers that don't understand missing in-map streams will
+  // misinterpret data. Keep this false until the new reader is fully rolled
+  // out, then default to true and eventually remove the option.
+  bool skipConstantFlatMapInMapStreams{false};
 
   // Columns that should be encoded as dictionary arrays
   // NOTE: For each column, ALL the arrays inside this column will be encoded
@@ -193,6 +214,13 @@ struct VeloxWriterOptions {
   // When true, string fields use per-field buffers instead of a shared buffer.
   // This enables incremental memory reclamation during chunking.
   bool disableSharedStringBuffers{false};
+
+  // When true, enables consistency check between fileRawSize (accumulated via
+  // RawSizeUtils) and the root column statistics during file close.
+  // This is used to validate that column statistics accurately track raw sizes,
+  // with the goal of eventually replacing RawSizeUtils accumulation with column
+  // statistics for non-deduplicated columns.
+  bool enableStatsConsistencyCheck{true};
 };
 
 } // namespace facebook::nimble

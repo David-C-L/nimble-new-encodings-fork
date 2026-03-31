@@ -24,7 +24,9 @@ add_executable(
   nimble_common_tests
   BitEncoderTests.cpp
   BitsTests.cpp
+  ChunkHeaderTest.cpp
   ConstantsTest.cpp
+  ExceptionHelperTest.cpp
   ExceptionTests.cpp
   FixedBitArrayTests.cpp
   VarintTests.cpp
@@ -36,6 +38,7 @@ add_test(nimble_common_tests nimble_common_tests)
 target_link_libraries(
   nimble_common_tests
   nimble_common
+  velox_common_base
   gtest
   gtest_main
   glog::glog

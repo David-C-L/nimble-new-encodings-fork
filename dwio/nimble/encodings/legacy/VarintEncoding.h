@@ -17,7 +17,6 @@
 
 #include <numeric>
 #include <span>
-#include "dwio/nimble/common/Bits.h"
 #include "dwio/nimble/common/Buffer.h"
 #include "dwio/nimble/common/EncodingPrimitives.h"
 #include "dwio/nimble/common/EncodingType.h"
@@ -178,7 +177,7 @@ std::string_view VarintEncoding<T>::encode(
   char* reserved = buffer.reserve(encodingSize);
   char* pos = reserved;
   Encoding::serializePrefix(
-      EncodingType::Varint, TypeTraits<T>::dataType, valueCount, pos);
+      EncodingType::Varint, TypeTraits<T>::dataType, valueCount, false, pos);
   encoding::write(selection.statistics().min(), pos);
   for (auto value : values) {
     varint::writeVarint(value - selection.statistics().min(), &pos);

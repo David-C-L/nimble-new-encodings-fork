@@ -22,12 +22,13 @@
 #include "dwio/nimble/common/tests/NimbleFileWriter.h"
 #include "dwio/nimble/common/tests/TestUtils.h"
 #include "dwio/nimble/encodings/EncodingFactory.h"
-#include "dwio/nimble/encodings/EncodingLayoutCapture.h"
+#include "dwio/nimble/encodings/EncodingLayout.h"
 #include "dwio/nimble/encodings/EncodingUtils.h"
 #include "dwio/nimble/encodings/PrefixEncoding.h"
 #include "dwio/nimble/encodings/tests/TestUtils.h"
 #include "dwio/nimble/index/tests/IndexTestUtils.h"
 #include "dwio/nimble/tablet/Constants.h"
+#include "dwio/nimble/tablet/FileLayout.h"
 #include "dwio/nimble/velox/ChunkedStream.h"
 #include "dwio/nimble/velox/EncodingLayoutTree.h"
 #include "dwio/nimble/velox/FlushPolicy.h"
@@ -82,9 +83,18 @@ TEST_F(VeloxWriterTest, emptyFile) {
   nimble::VeloxWriter writer(type, std::move(writeFile), *rootPool_, {});
   writer.close();
 
+  // Verify FileLayout for empty file using FileLayout::create()
   velox::InMemoryReadFile readFile(file);
-  nimble::VeloxReader reader(&readFile, *leafPool_);
+  auto layout = nimble::FileLayout::create(&readFile, leafPool_.get());
+  EXPECT_EQ(layout.fileSize, file.size());
+  EXPECT_EQ(layout.postscript.majorVersion(), nimble::kVersionMajor);
+  EXPECT_EQ(layout.postscript.minorVersion(), nimble::kVersionMinor);
+  EXPECT_GT(layout.footer.size(), 0);
+  EXPECT_TRUE(layout.stripeGroups.empty());
+  EXPECT_TRUE(layout.indexGroups.empty());
+  EXPECT_TRUE(layout.stripesInfo.empty());
 
+  nimble::VeloxReader reader(&readFile, *leafPool_);
   velox::VectorPtr result;
   ASSERT_FALSE(reader.next(1, result));
 }
@@ -108,9 +118,19 @@ TEST_F(VeloxWriterTest, emptyFileWithIndexEnabled) {
       type, std::move(writeFile), *rootPool_, {.indexConfig = indexConfig});
   writer.close();
 
+  // Verify FileLayout for empty file with index enabled using
+  // FileLayout::create()
   velox::InMemoryReadFile readFile(file);
-  nimble::VeloxReader reader(&readFile, *leafPool_);
+  auto layout = nimble::FileLayout::create(&readFile, leafPool_.get());
+  EXPECT_EQ(layout.fileSize, file.size());
+  EXPECT_EQ(layout.stripesInfo.size(), 0);
+  EXPECT_EQ(layout.stripeGroups.size(), 0);
+  EXPECT_TRUE(layout.stripeGroups.empty());
+  // Index groups should be empty for empty file (no stripes to index)
+  EXPECT_TRUE(layout.indexGroups.empty());
+  EXPECT_TRUE(layout.stripesInfo.empty());
 
+  nimble::VeloxReader reader(&readFile, *leafPool_);
   velox::VectorPtr result;
   ASSERT_FALSE(reader.next(1, result));
 }
@@ -226,12 +246,29 @@ TEST_F(VeloxWriterTest, rootHasNulls) {
   auto writeFile = std::make_unique<velox::InMemoryWriteFile>(&file);
   nimble::VeloxWriter writer(
       vector->type(), std::move(writeFile), *rootPool_, {});
+
   writer.write(vector);
   writer.close();
 
+  // Verify FileLayout for non-empty file without index using
+  // FileLayout::create()
   velox::InMemoryReadFile readFile(file);
-  nimble::VeloxReader reader(&readFile, *leafPool_);
+  auto layout = nimble::FileLayout::create(&readFile, leafPool_.get());
+  EXPECT_EQ(layout.fileSize, file.size());
+  EXPECT_EQ(layout.stripesInfo.size(), 1);
+  EXPECT_EQ(layout.stripeGroups.size(), 1);
+  EXPECT_EQ(layout.stripeGroups.size(), 1);
+  // No index configured
+  EXPECT_TRUE(layout.indexGroups.empty());
+  // Stripes metadata should be valid (stripeGroups not empty)
+  EXPECT_GT(layout.stripes.size(), 0);
+  EXPECT_LT(layout.stripes.offset(), layout.footer.offset());
+  // Per-stripe info
+  EXPECT_EQ(layout.stripesInfo.size(), 1);
+  EXPECT_EQ(layout.stripesInfo[0].stripeGroupIndex, 0);
+  EXPECT_GT(layout.stripesInfo[0].size, 0);
 
+  nimble::VeloxReader reader(&readFile, *leafPool_);
   velox::VectorPtr result;
   ASSERT_TRUE(reader.next(batchSize, result));
   ASSERT_EQ(result->size(), batchSize);
@@ -342,6 +379,125 @@ TEST_F(
                {0, {1, 2}}, {1, {3, 4}}}});
   writer.write(vector);
   writer.close();
+}
+
+TEST_F(VeloxWriterTest, featureReorderingStreamCollocation) {
+  velox::test::VectorMaker vectorMaker{leafPool_.get()};
+
+  const std::vector<int64_t> reorderedKeys = {4, 2, 0};
+  const int numRows = 1'000;
+
+  for (bool enableIndex : {false, true}) {
+    SCOPED_TRACE(fmt::format("enableIndex={}", enableIndex));
+
+    // With index: schema is (key, flatmap); without: just (flatmap).
+    // The flatmap column ordinal differs accordingly.
+    auto vector = enableIndex
+        ? vectorMaker.rowVector(
+              {"key", "flatmap"},
+              {vectorMaker.flatVector<int64_t>(
+                   numRows, [](auto row) { return static_cast<int64_t>(row); }),
+               vectorMaker.mapVector<int32_t, int32_t>(
+                   numRows,
+                   [](auto) { return 5; },
+                   [](auto, auto mapIndex) { return mapIndex; },
+                   [](auto row, auto mapIndex) { return row * 10 + mapIndex; },
+                   [](auto) { return false; })})
+        : vectorMaker.rowVector(
+              {"flatmap"},
+              {vectorMaker.mapVector<int32_t, int32_t>(
+                  numRows,
+                  [](auto) { return 5; },
+                  [](auto, auto mapIndex) { return mapIndex; },
+                  [](auto row, auto mapIndex) { return row * 10 + mapIndex; },
+                  [](auto) { return false; })});
+
+    const size_t flatmapOrdinal = enableIndex ? 1 : 0;
+
+    std::string file;
+    {
+      auto writeFile = std::make_unique<velox::InMemoryWriteFile>(&file);
+      nimble::VeloxWriterOptions options;
+      options.flatMapColumns = {"flatmap"};
+      options.featureReordering =
+          std::vector<std::tuple<size_t, std::vector<int64_t>>>{
+              {flatmapOrdinal, reorderedKeys}};
+
+      if (enableIndex) {
+        nimble::IndexConfig indexConfig;
+        indexConfig.columns = {"key"};
+        indexConfig.sortOrders = {nimble::SortOrder{.ascending = true}};
+        indexConfig.enforceKeyOrder = true;
+        indexConfig.encodingLayout = nimble::EncodingLayout{
+            nimble::EncodingType::Prefix,
+            {},
+            nimble::CompressionType::Uncompressed};
+        options.indexConfig = std::move(indexConfig);
+      }
+
+      nimble::VeloxWriter writer(
+          vector->type(), std::move(writeFile), *rootPool_, std::move(options));
+      writer.write(vector);
+      writer.close();
+    }
+
+    velox::InMemoryReadFile readFile(file);
+    auto tablet = nimble::TabletReader::create(&readFile, leafPool_.get(), {});
+    ASSERT_GE(tablet->stripeCount(), 1);
+    if (enableIndex) {
+      ASSERT_NE(tablet->clusterIndex(), nullptr) << "Cluster index must exist";
+    }
+
+    auto stripeId = tablet->stripeIdentifier(0);
+    auto offsets = tablet->streamOffsets(stripeId);
+    auto sizes = tablet->streamSizes(stripeId);
+
+    nimble::VeloxReader reader(&readFile, *leafPool_);
+    const auto& flatMap =
+        reader.schema()->asRow().childAt(flatmapOrdinal)->asFlatMap();
+
+    std::unordered_map<std::string, uint32_t> keyToValueStreamId;
+    for (size_t i = 0; i < flatMap.childrenCount(); ++i) {
+      keyToValueStreamId[flatMap.nameAt(i)] =
+          flatMap.childAt(i)->asScalar().scalarDescriptor().offset();
+    }
+
+    // Use value stream offsets for ordering since inMap streams may be
+    // constant-encoded and deduplicated when all keys are present in every row.
+    auto diskPosition = [&](const std::string& key) -> uint32_t {
+      return offsets[keyToValueStreamId.at(key)];
+    };
+
+    // Verify reordered keys appear in the specified order on disk.
+    for (size_t i = 1; i < reorderedKeys.size(); ++i) {
+      auto prevKey = folly::to<std::string>(reorderedKeys[i - 1]);
+      auto currKey = folly::to<std::string>(reorderedKeys[i]);
+      EXPECT_LT(diskPosition(prevKey), diskPosition(currKey))
+          << "Key " << prevKey << " should appear before key " << currKey
+          << " on disk";
+    }
+
+    // Verify reordered keys' value streams are contiguous (adjacent on disk).
+    for (size_t i = 1; i < reorderedKeys.size(); ++i) {
+      auto prevKey = folly::to<std::string>(reorderedKeys[i - 1]);
+      auto currKey = folly::to<std::string>(reorderedKeys[i]);
+      auto prevStreamId = keyToValueStreamId.at(prevKey);
+      auto currStreamId = keyToValueStreamId.at(currKey);
+      EXPECT_EQ(
+          offsets[prevStreamId] + sizes[prevStreamId], offsets[currStreamId])
+          << "Key " << prevKey << " value stream should be adjacent to key "
+          << currKey;
+    }
+
+    // Verify leftover keys (1, 3) appear after all reordered keys.
+    auto lastReorderedKey = folly::to<std::string>(reorderedKeys.back());
+    auto lastReorderedPos = diskPosition(lastReorderedKey);
+    for (const auto& leftoverKey : {"1", "3"}) {
+      EXPECT_GT(diskPosition(leftoverKey), lastReorderedPos)
+          << "Leftover key " << leftoverKey
+          << " should appear after last reordered key " << lastReorderedKey;
+    }
+  }
 }
 
 TEST_F(VeloxWriterTest, duplicateFlatmapKey) {
@@ -785,7 +941,7 @@ TEST_F(VeloxWriterTest, encodingLayout) {
   for (auto useChainedBuffers : {false, true}) {
     nimble::testing::InMemoryTrackableReadFile readFile(
         file, useChainedBuffers);
-    auto tablet = nimble::TabletReader::create(&readFile, *leafPool_);
+    auto tablet = nimble::TabletReader::create(&readFile, leafPool_.get(), {});
     auto section =
         tablet->loadOptionalSection(std::string(nimble::kSchemaSection));
     NIMBLE_CHECK(section.has_value(), "Schema not found.");
@@ -1306,7 +1462,7 @@ void testChunks(
   folly::writeFile(file, "/tmp/afile");
 
   auto tablet = nimble::TabletReader::create(
-      std::make_shared<velox::InMemoryReadFile>(file), *leafPool);
+      std::make_shared<velox::InMemoryReadFile>(file), leafPool.get(), {});
   verifier(*tablet);
 
   nimble::VeloxReader reader(
@@ -2180,12 +2336,13 @@ TEST_F(VeloxWriterTest, rawSizeWritten) {
     writer.close();
 
     auto readFilePtr = std::make_shared<velox::InMemoryReadFile>(file);
-    std::vector<std::string> preloadedOptionalSections = {
+    nimble::TabletReader::Options readerOptions;
+    readerOptions.preloadOptionalSections = {
         std::string(facebook::nimble::kStatsSection)};
     auto tablet = facebook::nimble::TabletReader::create(
-        readFilePtr, *leafPool_, preloadedOptionalSections);
+        readFilePtr, leafPool_.get(), readerOptions);
     auto statsSection =
-        tablet->loadOptionalSection(preloadedOptionalSections[0]);
+        tablet->loadOptionalSection(readerOptions.preloadOptionalSections[0]);
     ASSERT_TRUE(statsSection.has_value());
 
     // Use flatbuffers to deserialize the stats payload
@@ -2199,20 +2356,21 @@ TEST_F(VeloxWriterTest, rawSizeWritten) {
   {
     std::string file;
     auto writeFile = std::make_unique<velox::InMemoryWriteFile>(&file);
-    nimble::VeloxWriterOptions options{};
-    options.enableVectorizedStats = true;
+    nimble::VeloxWriterOptions writerOptions{};
+    writerOptions.enableVectorizedStats = true;
     nimble::VeloxWriter writer(
-        vector->type(), std::move(writeFile), *rootPool_, options);
+        vector->type(), std::move(writeFile), *rootPool_, writerOptions);
     writer.write(vector);
     writer.close();
 
     auto readFilePtr = std::make_shared<velox::InMemoryReadFile>(file);
-    std::vector<std::string> preloadedOptionalSections = {
+    nimble::TabletReader::Options readerOptions;
+    readerOptions.preloadOptionalSections = {
         std::string(facebook::nimble::kVectorizedStatsSection)};
     auto tablet = facebook::nimble::TabletReader::create(
-        readFilePtr, *leafPool_, preloadedOptionalSections);
+        readFilePtr, leafPool_.get(), readerOptions);
     auto statsSection =
-        tablet->loadOptionalSection(preloadedOptionalSections[0]);
+        tablet->loadOptionalSection(readerOptions.preloadOptionalSections[0]);
     ASSERT_TRUE(statsSection.has_value());
 
     // Use VectorizedFileStats to deserialize the stats payload
@@ -2339,7 +2497,7 @@ TEST_F(VeloxWriterTest, fuzzComplex) {
                                                     : folly::Random::rand32();
   LOG(INFO) << "seed: " << seed;
   std::mt19937 rng{seed};
-  for (auto parallelismFactor : {0U, 1U, folly::hardware_concurrency()}) {
+  for (auto parallelismFactor : {0U, 1U, folly::available_concurrency()}) {
     std::shared_ptr<folly::CPUThreadPoolExecutor> executor;
     nimble::VeloxWriterOptions writerOptions;
     writerOptions.enableChunking = true;
@@ -3070,15 +3228,20 @@ class VeloxWriterIndexTest
   void verifyPositionIndex(const nimble::TabletReader& tablet) {
     for (uint32_t stripeIdx = 0; stripeIdx < tablet.stripeCount();
          ++stripeIdx) {
-      const auto stripeId =
-          tablet.stripeIdentifier(stripeIdx, /*loadIndex=*/true);
-      ASSERT_NE(stripeId.indexGroup(), nullptr)
+      const auto stripeId = tablet.stripeIdentifier(stripeIdx);
+      ASSERT_NE(stripeId.clusterIndex(), nullptr)
           << "Index group should be available for stripe " << stripeIdx;
 
-      nimble::index::test::StripeIndexGroupTestHelper helper(
-          stripeId.indexGroup().get());
+      if (stripeId.chunkIndex() == nullptr) {
+        // Group was skipped (no streams with >1 chunk). Skip verification.
+        continue;
+      }
 
-      const uint32_t stripeOffsetInGroup = stripeIdx - helper.firstStripe();
+      nimble::index::test::ChunkIndexTestHelper chunkHelper(
+          stripeId.chunkIndex().get());
+
+      const uint32_t stripeOffsetInGroup =
+          stripeIdx - chunkHelper.firstStripe();
 
       // Load all streams for this stripe
       const uint32_t streamCount = tablet.streamCount(stripeId);
@@ -3091,7 +3254,11 @@ class VeloxWriterIndexTest
           continue;
         }
 
-        auto streamStats = helper.streamStats(streamId);
+        auto streamStats = chunkHelper.streamStats(streamId);
+        if (streamStats.chunkCounts.empty()) {
+          // Stream not indexed (0 or 1 chunk). Skip verification.
+          continue;
+        }
 
         // Get chunk count for this stripe from accumulated values
         const uint32_t prevChunkCount = (stripeOffsetInGroup == 0)
@@ -3187,8 +3354,8 @@ class VeloxWriterIndexTest
   // Verifies that the value index correctly maps each key to its row position.
   // For each row in the input batches:
   // 1. Encodes the key using KeyEncoder
-  // 2. Looks up the stripe via TabletIndex
-  // 3. Gets chunk location within stripe via StripeIndexGroup::lookupChunk
+  // 2. Looks up the stripe via ClusterIndex
+  // 3. Gets chunk location within stripe via ClusterIndexGroup::lookupChunk
   // 4. Loads the key stream chunk and decodes it
   // 5. Uses seekAtOrAfter to find the exact row within the chunk
   // 6. For duplicate keys, verifies the found row id matches the earliest row
@@ -3199,7 +3366,7 @@ class VeloxWriterIndexTest
       const velox::RowTypePtr& type,
       const std::vector<velox::RowVectorPtr>& batches,
       const std::vector<std::string>& indexColumns) {
-    const auto* index = tablet.index();
+    const auto* index = tablet.clusterIndex();
     ASSERT_NE(index, nullptr) << "Index must exist";
 
     // Pre-compute stripe start row offsets
@@ -3273,21 +3440,20 @@ class VeloxWriterIndexTest
             << "Stripe index out of range";
 
         // Get stripe identifier with index group loaded
-        const auto stripeId =
-            tablet.stripeIdentifier(stripeIndex, /*loadIndex=*/true);
-        ASSERT_NE(stripeId.indexGroup(), nullptr)
+        const auto stripeId = tablet.stripeIdentifier(stripeIndex);
+        ASSERT_NE(stripeId.clusterIndex(), nullptr)
             << "Index group should be available for stripe " << stripeIndex;
 
         // Look up chunk by encoded key to get chunk location within stripe
         const auto chunkLocation =
-            stripeId.indexGroup()->lookupChunk(stripeIndex, encodedKeyView);
+            stripeId.clusterIndex()->lookupChunk(stripeIndex, encodedKeyView);
         ASSERT_TRUE(chunkLocation.has_value())
             << "Key at row " << currentRowId << " should be found in stripe "
             << stripeIndex;
 
         // Get key stream region for this stripe
-        const auto keyStreamRegion =
-            stripeId.indexGroup()->keyStreamRegion(stripeIndex);
+        const auto keyStreamRegion = stripeId.clusterIndex()->keyStreamRegion(
+            stripeIndex, tablet.stripeOffset(stripeIndex));
 
         // Cache key: chunk file offset (unique across all stripes)
         const uint64_t chunkFileOffset =
@@ -3296,12 +3462,12 @@ class VeloxWriterIndexTest
         // Load and decode key chunk if not cached
         if (keyStreamCache.find(chunkFileOffset) == keyStreamCache.end()) {
           // Get chunk length from the index. The index stores chunk offsets
-          // in key_stream_chunk_offsets, so we can compute the length by
+          // in chunk_index.chunk_offsets, so we can compute the length by
           // looking at the next chunk offset (or stream end for the last
-          // chunk). Use helper to get chunk length from StripeIndexGroup
+          // chunk). Use helper to get chunk length from ClusterIndexGroup
           // internals.
-          nimble::index::test::StripeIndexGroupTestHelper helper(
-              stripeId.indexGroup().get());
+          nimble::index::test::ClusterIndexGroupTestHelper helper(
+              stripeId.clusterIndex().get());
           const uint32_t chunkLength = helper.keyChunkLength(
               stripeIndex, chunkLocation->streamOffset, keyStreamRegion.length);
 
@@ -3422,10 +3588,11 @@ TEST_P(VeloxWriterIndexTest, singleGroup) {
   }
 
   // Verify index section exists
-  EXPECT_TRUE(tablet.hasOptionalSection(std::string(nimble::kIndexSection)));
+  EXPECT_TRUE(
+      tablet.hasOptionalSection(std::string(nimble::kClusterIndexSection)));
 
   // Verify index is available
-  const auto* index = tablet.index();
+  const auto* index = tablet.clusterIndex();
   ASSERT_NE(index, nullptr);
 
   // Verify index columns
@@ -3506,10 +3673,11 @@ TEST_P(VeloxWriterIndexTest, multipleGroups) {
   }
 
   // Verify index section exists
-  EXPECT_TRUE(tablet.hasOptionalSection(std::string(nimble::kIndexSection)));
+  EXPECT_TRUE(
+      tablet.hasOptionalSection(std::string(nimble::kClusterIndexSection)));
 
   // Verify index is available
-  const auto* index = tablet.index();
+  const auto* index = tablet.clusterIndex();
   ASSERT_NE(index, nullptr);
 
   // Verify index columns
@@ -3533,19 +3701,12 @@ TEST_P(VeloxWriterIndexTest, multipleGroups) {
   ASSERT_TRUE(lastLocation.has_value());
   EXPECT_EQ(lastLocation->stripeIndex, index->numStripes() - 1);
 
-  // Verify stripeIdentifier with loadIndex returns index group
+  // Verify stripeIdentifier returns index group
   for (uint32_t i = 0; i < tablet.stripeCount(); ++i) {
-    auto stripeId = tablet.stripeIdentifier(i, /*loadIndex=*/true);
+    auto stripeId = tablet.stripeIdentifier(i);
     EXPECT_NE(stripeId.stripeGroup(), nullptr);
-    EXPECT_NE(stripeId.indexGroup(), nullptr)
+    EXPECT_NE(stripeId.clusterIndex(), nullptr)
         << "Index group should be available for stripe " << i;
-  }
-
-  // Verify stripeIdentifier without loadIndex does not return index group
-  {
-    auto stripeId = tablet.stripeIdentifier(0, /*loadIndex=*/false);
-    EXPECT_NE(stripeId.stripeGroup(), nullptr);
-    EXPECT_EQ(stripeId.indexGroup(), nullptr);
   }
 
   // Read back all data and verify row-by-row match with written batches
@@ -3615,7 +3776,7 @@ TEST_P(VeloxWriterIndexTest, multipleIndexColumns) {
   nimble::VeloxReader reader(&readFile, *leafPool_);
 
   const auto& tablet = reader.tabletReader();
-  const auto* index = tablet.index();
+  const auto* index = tablet.clusterIndex();
   ASSERT_NE(index, nullptr);
 
   // Verify both columns are indexed
@@ -3685,6 +3846,7 @@ TEST_F(VeloxWriterTest, indexEnforceKeyOrder) {
       nimble::IndexConfig indexConfig{
           .columns = {"key_col"},
           .enforceKeyOrder = enforceKeyOrder,
+          .noDuplicateKey = enforceKeyOrder,
       };
 
       std::string file;
@@ -3736,10 +3898,139 @@ TEST_F(VeloxWriterTest, indexEnforceKeyOrder) {
         velox::InMemoryReadFile readFile(file);
         nimble::VeloxReader reader(&readFile, *leafPool_);
         EXPECT_TRUE(reader.tabletReader().hasOptionalSection(
-            std::string(nimble::kIndexSection)));
+            std::string(nimble::kClusterIndexSection)));
       }
     }
   }
+}
+
+TEST_P(VeloxWriterIndexTest, duplicateKeys) {
+  // Test index with duplicate key values (non-unique keys).
+  // This is a valid scenario where multiple rows have the same key value.
+  auto type = defaultType();
+
+  nimble::IndexConfig indexConfig = createIndexConfig({"key_col"});
+
+  std::string file;
+  auto writeFile = std::make_unique<velox::InMemoryWriteFile>(&file);
+
+  // constexpr int kNumBatches = 10;
+  constexpr int kNumBatches = 1;
+  // constexpr int kBatchSize = 100;
+  constexpr int kBatchSize = 32;
+  constexpr uint32_t kSeed = 12345;
+  // Use flush-per-batch to create multiple stripes
+  nimble::VeloxWriter writer(
+      type,
+      std::move(writeFile),
+      *rootPool_,
+      createWriterOptions(indexConfig, []() {
+        return std::make_unique<nimble::LambdaFlushPolicy>(
+            [](auto) { return true; }, [](auto) { return false; });
+      }));
+
+  velox::test::VectorMaker vectorMaker{leafPool_.get()};
+
+  // Configure fuzzer to generate various encodings for non-key columns
+  velox::VectorFuzzer::Options fuzzerOpts;
+  fuzzerOpts.vectorSize = kBatchSize;
+  fuzzerOpts.nullRatio = 0.1;
+  fuzzerOpts.containerLength = 5;
+  fuzzerOpts.stringLength = 20;
+  fuzzerOpts.containerVariableLength = true;
+  velox::VectorFuzzer fuzzer(fuzzerOpts, leafPool_.get(), kSeed);
+
+  // Generate pre-sorted batches with duplicate keys.
+  // Each key value repeats 5 times before incrementing.
+  std::vector<velox::RowVectorPtr> batches;
+  int64_t keyVal = 0;
+  for (int batch = 0; batch < kNumBatches; ++batch) {
+    std::vector<int64_t> keyValues;
+
+    for (int i = 0; i < kBatchSize; ++i) {
+      keyValues.push_back(keyVal);
+      // Increment key every 5 rows to create duplicates
+      if (((batch * kBatchSize + i + 1) % 5) == 0) {
+        ++keyVal;
+      }
+    }
+
+    // Build children: key column + fuzzed non-key columns
+    std::vector<velox::VectorPtr> children;
+    children.push_back(vectorMaker.flatVector<int64_t>(keyValues));
+    for (size_t colIdx = 1; colIdx < type->size(); ++colIdx) {
+      children.push_back(fuzzer.fuzz(type->childAt(colIdx)));
+    }
+
+    auto batchVec = std::make_shared<velox::RowVector>(
+        leafPool_.get(),
+        type,
+        nullptr, // no nulls at top level
+        kBatchSize,
+        std::move(children));
+    batches.push_back(batchVec);
+    writer.write(batchVec);
+  }
+  writer.close();
+
+  // Read and verify
+  velox::InMemoryReadFile readFile(file);
+
+  // Verify FileLayout for non-empty file with index using FileLayout::create()
+  {
+    auto layout = nimble::FileLayout::create(&readFile, leafPool_.get());
+    EXPECT_EQ(layout.fileSize, file.size());
+    EXPECT_EQ(layout.stripesInfo.size(), kNumBatches);
+    EXPECT_EQ(layout.stripeGroups.size(), 1);
+    EXPECT_EQ(layout.stripeGroups.size(), 1);
+    // With index enabled, should have index groups
+    EXPECT_EQ(layout.indexGroups.size(), 1);
+    // Stripes metadata should be valid
+    EXPECT_GT(layout.stripes.size(), 0);
+    EXPECT_LT(layout.stripes.offset(), layout.footer.offset());
+    // Index group should be before stripes section
+    EXPECT_LT(layout.indexGroups[0].offset(), layout.stripes.offset());
+    // Per-stripe info
+    EXPECT_EQ(layout.stripesInfo.size(), kNumBatches);
+    for (size_t i = 0; i < layout.stripesInfo.size(); ++i) {
+      EXPECT_EQ(layout.stripesInfo[i].stripeGroupIndex, 0);
+      EXPECT_GT(layout.stripesInfo[i].size, 0);
+    }
+  }
+  nimble::VeloxReader reader(&readFile, *leafPool_);
+
+  const auto& tablet = reader.tabletReader();
+
+  // Verify index exists
+  const auto* index = tablet.clusterIndex();
+  ASSERT_NE(index, nullptr);
+  EXPECT_EQ(index->indexColumns().size(), 1);
+  EXPECT_EQ(index->indexColumns()[0], "key_col");
+
+  // Verify stripe keys are monotonically increasing (even with duplicates)
+  for (uint32_t i = 1; i < index->numStripes(); ++i) {
+    EXPECT_LE(index->stripeKey(i - 1), index->stripeKey(i))
+        << "Stripe keys should be in non-descending order";
+  }
+
+  // Verify we can look up stripes by key
+  auto firstLocation = index->lookup(index->minKey());
+  ASSERT_TRUE(firstLocation.has_value());
+  EXPECT_EQ(firstLocation->stripeIndex, 0);
+
+  auto lastLocation = index->lookup(index->maxKey());
+  ASSERT_TRUE(lastLocation.has_value());
+  EXPECT_EQ(lastLocation->stripeIndex, index->numStripes() - 1);
+
+  // Read back all data and verify row-by-row match with written batches
+  verifyFileData(file, type, batches);
+
+  // Verify position index chunk row counts
+  verifyPositionIndex(tablet);
+
+  // Verify value index maps each key to correct row position
+  // With duplicate keys, lookup should find the first occurrence
+  verifyValueIndex(tablet, &readFile, type, batches, {"key_col"});
 }
 
 TEST_P(VeloxWriterIndexTest, chunking) {
@@ -3778,7 +4069,7 @@ TEST_P(VeloxWriterIndexTest, chunking) {
   const auto& tablet = reader.tabletReader();
 
   // Verify index exists and works
-  const auto* index = tablet.index();
+  const auto* index = tablet.clusterIndex();
   ASSERT_NE(index, nullptr);
   EXPECT_EQ(index->indexColumns().size(), 1);
   EXPECT_EQ(index->indexColumns()[0], "key_col");
@@ -3790,8 +4081,8 @@ TEST_P(VeloxWriterIndexTest, chunking) {
 
   // Verify index group can be loaded for each stripe
   for (uint32_t i = 0; i < tablet.stripeCount(); ++i) {
-    auto stripeId = tablet.stripeIdentifier(i, /*loadIndex=*/true);
-    ASSERT_NE(stripeId.indexGroup(), nullptr);
+    auto stripeId = tablet.stripeIdentifier(i);
+    ASSERT_NE(stripeId.clusterIndex(), nullptr);
   }
 
   // Read back all data and verify row-by-row match with written batches
@@ -3893,7 +4184,7 @@ TEST_P(VeloxWriterIndexTest, streamDeduplication) {
   const auto& tablet = reader.tabletReader();
 
   // Verify index exists
-  const auto* index = tablet.index();
+  const auto* index = tablet.clusterIndex();
   ASSERT_NE(index, nullptr);
   EXPECT_EQ(index->indexColumns().size(), 1);
   EXPECT_EQ(index->indexColumns()[0], "key_col");
@@ -3986,18 +4277,19 @@ TEST_F(VeloxWriterTest, customPrefixRestartInterval) {
 
     // Read back and verify the restart interval in the key encoding
     velox::InMemoryReadFile readFile(file);
-    auto tablet = nimble::TabletReader::create(&readFile, *leafPool_);
+    auto tablet = nimble::TabletReader::create(&readFile, leafPool_.get(), {});
 
-    const auto* index = tablet->index();
+    const auto* index = tablet->clusterIndex();
     ASSERT_NE(index, nullptr) << "Index must exist";
 
     // Get first stripe's index group
-    const auto stripeId = tablet->stripeIdentifier(0, /*loadIndex=*/true);
-    ASSERT_NE(stripeId.indexGroup(), nullptr)
+    const auto stripeId = tablet->stripeIdentifier(0);
+    ASSERT_NE(stripeId.clusterIndex(), nullptr)
         << "Index group should be available";
 
     // Get key stream region
-    const auto keyStreamRegion = stripeId.indexGroup()->keyStreamRegion(0);
+    const auto keyStreamRegion =
+        stripeId.clusterIndex()->keyStreamRegion(0, tablet->stripeOffset(0));
 
     // Load the key stream data
     velox::common::Region region{

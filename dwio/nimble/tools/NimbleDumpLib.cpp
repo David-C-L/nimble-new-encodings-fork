@@ -22,20 +22,21 @@
 #include <unordered_set>
 #include <utility>
 
-#include "common/strings/Zstd.h"
-#include "dwio/common/filesystem/FileSystem.h"
+#include <zstd.h>
 #include "dwio/nimble/common/FixedBitArray.h"
 #include "dwio/nimble/common/Types.h"
 #include "dwio/nimble/encodings/EncodingFactory.h"
 #include "dwio/nimble/encodings/EncodingLayout.h"
 #include "dwio/nimble/encodings/tests/TestUtils.h"
 #include "dwio/nimble/tablet/Constants.h"
+#include "dwio/nimble/tablet/FileLayout.h"
 #include "dwio/nimble/tools/EncodingUtilities.h"
 #include "dwio/nimble/tools/NimbleDumpLib.h"
 #include "dwio/nimble/velox/EncodingLayoutTree.h"
 #include "dwio/nimble/velox/StatsGenerated.h"
 #include "dwio/nimble/velox/VeloxReader.h"
 #include "folly/cli/NestedCommandLineApp.h"
+#include "velox/common/file/FileSystems.h"
 
 namespace facebook::nimble::tools {
 #undef RED
@@ -229,7 +230,8 @@ void printScalarData(
   } else {
     for (uint32_t i = 0; i < rowCount; ++i) {
       assert(stream.isNullable());
-      if (nimble::bits::getBit(i, nulls.data()) == 0) {
+      if (velox::bits::isBitSet(
+              reinterpret_cast<const uint8_t*>(nulls.data()), i) == 0) {
         ostream << "NULL" << separator;
       } else {
         // Have to use folly::to as Int8 was getting converted to char.
@@ -273,29 +275,38 @@ void printScalarType(
 
 template <typename T>
 auto commaSeparated(T value) {
-  return fmt::format(std::locale("en_US.UTF-8"), "{:L}", value);
+  try {
+    return fmt::format(std::locale("en_US.UTF-8"), "{:L}", value);
+  } catch (const std::runtime_error&) {
+    return fmt::format("{}", value);
+  }
 }
 
 } // namespace
 
 NimbleDumpLib::NimbleDumpLib(
-    std::ostream& ostream,
+    const std::string& filePath,
     bool enableColors,
-    const std::string& file)
+    std::ostream& ostream)
     : pool_{velox::memory::deprecatedAddDefaultLeafMemoryPool()},
-      file_{dwio::file_system::FileSystem::openForRead(
-          file,
-          dwio::common::request::AccessDescriptorBuilder()
-              .withClientId("nimble_dump")
-              .build())},
+      file_{velox::filesystems::getFileSystem(filePath, nullptr)
+                ->openFileForRead(filePath)},
+      ostream_{ostream},
+      enableColors_{enableColors} {}
+
+NimbleDumpLib::NimbleDumpLib(
+    std::shared_ptr<velox::ReadFile> file,
+    bool enableColors,
+    std::ostream& ostream)
+    : pool_{velox::memory::deprecatedAddDefaultLeafMemoryPool()},
+      file_{std::move(file)},
       ostream_{ostream},
       enableColors_{enableColors} {}
 
 void NimbleDumpLib::emitInfo() {
-  std::vector<std::string> preloadedOptionalSections = {
-      std::string(kStatsSection)};
-  const auto tablet =
-      TabletReader::create(file_.get(), *pool_, preloadedOptionalSections);
+  TabletReader::Options options;
+  options.preloadOptionalSections = {std::string(kStatsSection)};
+  const auto tablet = TabletReader::create(file_.get(), pool_.get(), options);
   ostream_ << CYAN(enableColors_) << "Nimble File "
            << RESET_COLOR(enableColors_) << "Version " << tablet->majorVersion()
            << "." << tablet->minorVersion() << std::endl;
@@ -344,7 +355,7 @@ void NimbleDumpLib::emitInfo() {
 
   VeloxReader reader{tablet, *pool_};
 
-  auto statsSection = tablet->loadOptionalSection(preloadedOptionalSections[0]);
+  auto statsSection = tablet->loadOptionalSection(std::string(kStatsSection));
   ostream_ << "Raw Data Size: ";
   if (statsSection.has_value()) {
     auto rawSize = flatbuffers::GetRoot<nimble::serialization::Stats>(
@@ -352,10 +363,7 @@ void NimbleDumpLib::emitInfo() {
                        ->raw_size();
     ostream_ << commaSeparated(rawSize) << std::endl;
     const auto compressionRate = (double)rawSize / tablet->fileSize();
-    ostream_ << fmt::format(
-                    std::locale("en_US.UTF-8"),
-                    "Compression Rate: {:.2Lf}x",
-                    compressionRate)
+    ostream_ << "Compression Rate: " << fmt::format("{:.2f}x", compressionRate)
              << std::endl;
   } else {
     ostream_ << "N/A" << std::endl;
@@ -372,7 +380,7 @@ void NimbleDumpLib::emitInfo() {
 }
 
 void NimbleDumpLib::emitSchema(bool collapseFlatMap) {
-  auto tablet = TabletReader::create(file_.get(), *pool_);
+  auto tablet = TabletReader::create(file_.get(), pool_.get(), {});
   VeloxReader reader{tablet, *pool_};
 
   auto emitOffsets = [](const Type& type) {
@@ -475,7 +483,7 @@ void NimbleDumpLib::emitSchema(bool collapseFlatMap) {
 }
 
 void NimbleDumpLib::emitStripes(bool noHeader) {
-  const auto tabletReader = TabletReader::create(file_.get(), *pool_);
+  const auto tabletReader = TabletReader::create(file_.get(), pool_.get(), {});
   TableFormatter formatter(
       ostream_,
       enableColors_,
@@ -507,7 +515,7 @@ void NimbleDumpLib::emitStreams(
     bool showStreamRawSize,
     bool showInMapStream,
     std::optional<uint32_t> stripeId) {
-  auto tabletReader = TabletReader::create(file_.get(), *pool_);
+  auto tabletReader = TabletReader::create(file_.get(), pool_.get(), {});
 
   std::vector<std::tuple<std::string, uint8_t, Alignment>> fields;
   fields.emplace_back("Stripe Id", 9, Alignment::Left);
@@ -598,7 +606,7 @@ void NimbleDumpLib::emitHistogram(
     bool topLevel,
     bool noHeader,
     std::optional<uint32_t> stripeId) {
-  auto tabletReader = TabletReader::create(file_.get(), *pool_);
+  auto tabletReader = TabletReader::create(file_.get(), pool_.get(), {});
   std::unordered_map<
       GroupingKey,
       EncodingHistogramValue,
@@ -685,7 +693,7 @@ void NimbleDumpLib::emitContent(
     uint32_t streamId,
     std::optional<uint32_t> stripeId,
     const std::string& separator) {
-  auto tabletReader = TabletReader::create(file_.get(), *pool_);
+  auto tabletReader = TabletReader::create(file_.get(), pool_.get(), {});
 
   uint32_t maxStreamCount;
   bool found = false;
@@ -737,7 +745,7 @@ void NimbleDumpLib::emitBinary(
     std::function<std::unique_ptr<std::ostream>()> outputFactory,
     uint32_t streamId,
     uint32_t stripeId) {
-  auto tabletReader = TabletReader::create(file_.get(), *pool_);
+  auto tabletReader = TabletReader::create(file_.get(), pool_.get(), {});
   auto stripeIdentifier = tabletReader->stripeIdentifier(stripeId);
   if (streamId >= tabletReader->streamCount(stripeIdentifier)) {
     throw folly::ProgramExit(
@@ -884,10 +892,17 @@ void NimbleDumpLib::emitLayout(bool noHeader, bool compressed) {
   buffer.resize(size);
   file_->pread(0, size, buffer.data());
   if (compressed) {
-    std::string uncompressed;
+    auto const decompressedSize =
+        ZSTD_getFrameContentSize(buffer.data(), buffer.size());
     NIMBLE_CHECK(
-        strings::zstdDecompress(buffer, &uncompressed),
-        "Decompress failed during `emitLayout`");
+        decompressedSize != ZSTD_CONTENTSIZE_ERROR &&
+            decompressedSize != ZSTD_CONTENTSIZE_UNKNOWN,
+        "Decompress failed during `emitLayout`: unable to determine decompressed size");
+    std::string uncompressed;
+    uncompressed.resize(decompressedSize);
+    auto const ret = ZSTD_decompress(
+        uncompressed.data(), uncompressed.size(), buffer.data(), buffer.size());
+    NIMBLE_CHECK(!ZSTD_isError(ret), "Decompress failed during `emitLayout`");
     buffer = std::move(uncompressed);
   }
 
@@ -941,7 +956,7 @@ void NimbleDumpLib::emitLayout(bool noHeader, bool compressed) {
 }
 
 void NimbleDumpLib::emitStripesMetadata(bool noHeader) {
-  auto tabletReader = TabletReader::create(file_.get(), *pool_);
+  auto tabletReader = TabletReader::create(file_.get(), pool_.get(), {});
   TableFormatter formatter(
       ostream_,
       enableColors_,
@@ -970,22 +985,22 @@ void NimbleDumpLib::emitFileLayout(bool noHeader) {
     uint64_t size;
   };
 
-  auto tablet = TabletReader::create(file_.get(), *pool_);
+  auto layout = FileLayout::create(file_.get(), pool_.get());
   std::vector<Entry> entries;
 
-  auto stripesMetadata = tablet->stripesMetadata();
-  if (stripesMetadata) {
+  // Stripes metadata section
+  if (!layout.stripeGroups.empty()) {
     entries.push_back({
         "Stripes Metadata",
-        toString(stripesMetadata->compressionType()),
-        stripesMetadata->offset(),
-        stripesMetadata->size(),
+        toString(layout.stripes.compressionType()),
+        layout.stripes.offset(),
+        layout.stripes.size(),
     });
   }
 
-  auto stripeGroupsMetadata = tablet->stripeGroupsMetadata();
-  for (auto i = 0; i < stripeGroupsMetadata.size(); ++i) {
-    const auto& metadata = stripeGroupsMetadata[i];
+  // Stripe groups
+  for (size_t i = 0; i < layout.stripeGroups.size(); ++i) {
+    const auto& metadata = layout.stripeGroups[i];
     entries.push_back({
         fmt::format("Stripe Group {}", i),
         toString(metadata.compressionType()),
@@ -994,19 +1009,19 @@ void NimbleDumpLib::emitFileLayout(bool noHeader) {
     });
   }
 
-  traverseTablet(*pool_, *tablet, std::nullopt, [&](uint32_t stripeIndex) {
-    auto stripeIdentifier = tablet->stripeIdentifier(stripeIndex);
-    auto sizes = tablet->streamSizes(stripeIdentifier);
-    auto stripeSize = std::accumulate(sizes.begin(), sizes.end(), 0UL);
+  // Per-stripe info (includes stripe group index in name)
+  for (size_t i = 0; i < layout.stripesInfo.size(); ++i) {
+    const auto& stripeInfo = layout.stripesInfo[i];
     entries.push_back({
-        fmt::format("Stripe {}", stripeIndex),
+        fmt::format("Stripe {} (Group {})", i, stripeInfo.stripeGroupIndex),
         "NA",
-        tablet->stripeOffset(stripeIndex),
-        stripeSize,
+        stripeInfo.offset,
+        stripeInfo.size,
     });
-  });
+  }
 
-  for (const auto& [name, metadata] : tablet->optionalSections()) {
+  // Optional sections
+  for (const auto& [name, metadata] : layout.optionalSections) {
     entries.push_back({
         fmt::format("Optional Section {}", name),
         toString(metadata.compressionType()),
@@ -1015,17 +1030,21 @@ void NimbleDumpLib::emitFileLayout(bool noHeader) {
     });
   }
 
-  entries.push_back(
-      {"File Footer",
-       toString(tablet->footerCompressionType()),
-       tablet->fileSize() - tablet->footerSize() - kPostscriptSize,
-       tablet->footerSize()});
+  // Footer
+  entries.push_back({
+      "File Footer",
+      toString(layout.footer.compressionType()),
+      layout.footer.offset(),
+      layout.footer.size(),
+  });
 
-  entries.push_back(
-      {"File Postscript",
-       "NA",
-       tablet->fileSize() - kPostscriptSize,
-       kPostscriptSize});
+  // Postscript
+  entries.push_back({
+      "File Postscript",
+      "NA",
+      layout.fileSize - kPostscriptSize,
+      kPostscriptSize,
+  });
 
   std::sort(
       entries.begin(), entries.end(), [](const Entry& lhs, const Entry& rhs) {
@@ -1054,7 +1073,7 @@ void NimbleDumpLib::emitFileLayout(bool noHeader) {
 }
 
 void NimbleDumpLib::emitStripeGroupsMetadata(bool noHeader) {
-  auto tabletReader = TabletReader::create(file_.get(), *pool_);
+  auto tabletReader = TabletReader::create(file_.get(), pool_.get(), {});
   TableFormatter formatter(
       ostream_,
       enableColors_,
@@ -1083,7 +1102,7 @@ void NimbleDumpLib::emitOptionalSectionsMetadata(bool noHeader) {
     nimble::MetadataSection metadata;
   };
 
-  auto tabletReader = TabletReader::create(file_.get(), *pool_);
+  auto tabletReader = TabletReader::create(file_.get(), pool_.get(), {});
   std::vector<NamedMetdataSection> sections;
   sections.reserve(tabletReader->optionalSections().size());
   for (const auto& [name, metadata] : tabletReader->optionalSections()) {
@@ -1115,13 +1134,13 @@ void NimbleDumpLib::emitOptionalSectionsMetadata(bool noHeader) {
 }
 
 void NimbleDumpLib::emitIndex() {
-  auto tabletReader = TabletReader::create(file_.get(), *pool_);
-  if (!tabletReader->hasIndex()) {
+  auto tabletReader = TabletReader::create(file_.get(), pool_.get(), {});
+  if (!tabletReader->hasClusterIndex()) {
     ostream_ << "Index: Not configured" << std::endl;
     return;
   }
 
-  const auto* index = tabletReader->index();
+  const auto* index = tabletReader->clusterIndex();
   ostream_ << CYAN(enableColors_) << "Index" << RESET_COLOR(enableColors_)
            << std::endl;
   ostream_ << "Index Columns: ";
@@ -1151,7 +1170,7 @@ void NimbleDumpLib::emitIndex() {
          {"Size", 15, Alignment::Right}},
         /*noHeader=*/false);
     for (size_t i = 0; i < index->numIndexGroups(); ++i) {
-      auto metadata = index->groupIndexMetadata(i);
+      auto metadata = index->groupMetadata(i);
       groupFormatter.writeRow({
           std::to_string(i),
           toString(metadata.compressionType()),
@@ -1171,10 +1190,9 @@ void NimbleDumpLib::emitIndex() {
         /*noHeader=*/false);
     for (size_t stripeIndex = 0; stripeIndex < index->numStripes();
          ++stripeIndex) {
-      auto stripeId =
-          tabletReader->stripeIdentifier(stripeIndex, /*loadIndex=*/true);
-      auto keyStreamRegion =
-          stripeId.indexGroup()->keyStreamRegion(stripeIndex);
+      auto stripeId = tabletReader->stripeIdentifier(stripeIndex);
+      auto keyStreamRegion = stripeId.clusterIndex()->keyStreamRegion(
+          stripeIndex, tabletReader->stripeOffset(stripeIndex));
       keyStreamFormatter.writeRow({
           std::to_string(stripeIndex),
           commaSeparated(keyStreamRegion.offset),

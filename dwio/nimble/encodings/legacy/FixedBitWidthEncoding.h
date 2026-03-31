@@ -18,7 +18,6 @@
 #include <span>
 #include <type_traits>
 
-#include "dwio/nimble/common/Bits.h"
 #include "dwio/nimble/common/Buffer.h"
 #include "dwio/nimble/common/EncodingPrimitives.h"
 #include "dwio/nimble/common/EncodingType.h"
@@ -101,6 +100,7 @@ FixedBitWidthEncoding<T>::FixedBitWidthEncoding(
     uncompressedData_ = Compression::uncompress(
         memoryPool,
         compressionType,
+        TypeTraits<physicalType>::dataType,
         {pos, static_cast<size_t>(data.end() - pos)});
     fixedBitArray_ = FixedBitArray{
         {uncompressedData_.data(), uncompressedData_.size()}, bitWidth_};
@@ -179,7 +179,7 @@ std::string_view FixedBitWidthEncoding<T>::encode(
   // 3. Try both bit width and byte width and pick one.
   // 4. etc...
   const int bitsRequired =
-      (bits::bitsRequired(
+      (velox::bits::bitsRequired(
            selection.statistics().max() - selection.statistics().min()) +
        7) &
       ~7;
@@ -225,7 +225,11 @@ std::string_view FixedBitWidthEncoding<T>::encode(
   char* reserved = buffer.reserve(encodingSize);
   char* pos = reserved;
   Encoding::serializePrefix(
-      EncodingType::FixedBitWidth, TypeTraits<T>::dataType, rowCount, pos);
+      EncodingType::FixedBitWidth,
+      TypeTraits<T>::dataType,
+      rowCount,
+      false,
+      pos);
   encoding::writeChar(
       static_cast<char>(compressionEncoder.compressionType()), pos);
   encoding::write(selection.statistics().min(), pos);

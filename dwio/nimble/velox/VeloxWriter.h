@@ -26,8 +26,8 @@
 #include "velox/vector/BaseVector.h"
 #include "velox/vector/DecodedVector.h"
 
-// The VeloxWriter takes a velox VectorPtr and writes it to an Nimble file
-// format.
+/// The VeloxWriter takes a velox VectorPtr and writes it to an Nimble file
+/// format.
 
 namespace facebook::nimble {
 
@@ -39,7 +39,7 @@ class WriterContext;
 
 using index::IndexWriter;
 
-// Writer that takes velox vector as input and produces nimble file.
+/// Writer that takes velox vector as input and produces nimble file.
 class VeloxWriter {
  public:
   VeloxWriter(
@@ -50,35 +50,44 @@ class VeloxWriter {
 
   ~VeloxWriter();
 
-  // Return value of 'true' means this write ended with a flush.
+  /// Return value of 'true' means this write ended with a flush.
   bool write(const velox::VectorPtr& input);
 
   void close();
 
   void flush();
 
-  struct RunStats {
+  struct Stats {
+    /// Total bytes written to the file.
     uint64_t bytesWritten;
+    /// Number of stripes written to the file.
     uint32_t stripeCount;
+    /// Uncompressed size of data written to the file.
     uint64_t rawSize;
+    /// Number of rows in each stripe.
     std::vector<uint64_t> rowsPerStripe;
-    uint64_t flushCpuTimeUsec;
-    uint64_t flushWallTimeUsec;
-    uint64_t encodingSelectionCpuTimeUsec;
-    // These 2 stats should be from memory pool and have better
-    // coverage in the future.
+    /// CPU time spent flushing data in microseconds.
+    uint64_t flushCpuTimeUs;
+    /// Wall clock time spent flushing data in microseconds.
+    uint64_t flushWallTimeUs;
+    /// CPU time spent on encoding selection in microseconds.
+    uint64_t encodingSelectionCpuTimeUs;
+    /// Number of input buffer reallocations. These 2 stats should be from
+    /// memory pool and have better coverage in the future.
     uint64_t inputBufferReallocCount;
+    /// Number of items moved during input buffer reallocations.
     uint64_t inputBufferReallocItemCount;
-    // std::unordered_map<offset_size, ColumnStats> columnStats;
-    // Only available at file close.
-    // NOTE: expected to be exposed as a view, for merging with
-    // base stats objects. User needs to explicitly copy.
+    /// Per-column statistics. Only available at file close.
+    /// NOTE: expected to be exposed as a view, for merging with base stats
+    /// objects. User needs to explicitly copy.
     std::vector<ColumnStatistics*> columnStats;
   };
-  RunStats getRunStats() const;
+
+  /// Returns writer statistics.
+  Stats stats() const;
 
  private:
-  inline bool hasIndex() const;
+  inline bool hasClusterIndex() const;
 
   // Adds index key to the index writer. If barrier is provided, the processing
   // will be added to the barrier for parallel execution.

@@ -15,8 +15,13 @@
  */
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <iterator>
 #include <limits>
+#include <thread>
 
 #include "dwio/nimble/common/Buffer.h"
 #include "dwio/nimble/common/Checksum.h"
@@ -24,8 +29,10 @@
 #include "dwio/nimble/common/Types.h"
 #include "dwio/nimble/common/tests/GTestUtils.h"
 #include "dwio/nimble/common/tests/TestUtils.h"
+#include "dwio/nimble/index/ChunkIndexGroup.h"
 #include "dwio/nimble/index/tests/IndexTestUtils.h"
 #include "dwio/nimble/tablet/Constants.h"
+#include "dwio/nimble/tablet/FileLayout.h"
 #include "dwio/nimble/tablet/TabletReader.h"
 #include "dwio/nimble/tablet/TabletWriter.h"
 #include "dwio/nimble/tablet/tests/TabletTestUtils.h"
@@ -33,7 +40,14 @@
 #include "folly/Random.h"
 #include "folly/executors/CPUThreadPoolExecutor.h"
 #include "velox/common/file/File.h"
+
+#include "velox/common/caching/AsyncDataCache.h"
+#include "velox/common/caching/FileIds.h"
+#include "velox/common/memory/MallocAllocator.h"
 #include "velox/common/memory/Memory.h"
+#include "velox/dwio/common/BufferedInput.h"
+#include "velox/dwio/common/CachedBufferedInput.h"
+#include "velox/dwio/common/DirectBufferedInput.h"
 #include "velox/dwio/common/ExecutorBarrier.h"
 
 using namespace facebook;
@@ -52,6 +66,32 @@ DEFINE_uint32(
 
 // Total size of the fields after the flatbuffer.
 constexpr uint32_t kPostscriptSize = 20;
+
+/// BufferedInput test modes for parameterized testing.
+enum class BufferedInputMode {
+  /// No BufferedInput - direct file reads.
+  kNone,
+  /// Base BufferedInput class (no cache).
+  kBufferedInput,
+  /// DirectBufferedInput (no cache, but with coalescing).
+  kDirectBufferedInput,
+  /// CachedBufferedInput with AsyncDataCache.
+  kCachedBufferedInput,
+};
+
+std::string bufferedInputModeToString(BufferedInputMode mode) {
+  switch (mode) {
+    case BufferedInputMode::kNone:
+      return "None";
+    case BufferedInputMode::kBufferedInput:
+      return "BufferedInput";
+    case BufferedInputMode::kDirectBufferedInput:
+      return "DirectBufferedInput";
+    case BufferedInputMode::kCachedBufferedInput:
+      return "CachedBufferedInput";
+  }
+  return "Unknown";
+}
 
 struct StripeSpecifications {
   uint32_t rowCount;
@@ -108,13 +148,125 @@ std::vector<StripeData> createStripesData(
   return stripesData;
 }
 
-class TabletTest : public ::testing::Test {
+class TabletTest : public ::testing::TestWithParam<BufferedInputMode> {
  protected:
   static void SetUpTestCase() {
     velox::memory::MemoryManager::testingSetInstance({});
   }
 
-  void SetUp() override {}
+  void SetUp() override {
+    executor_ = std::make_unique<folly::CPUThreadPoolExecutor>(2);
+    ioStatistics_ = std::make_shared<velox::dwio::common::IoStatistics>();
+  }
+
+  void TearDown() override {
+    bufferedInput_.reset();
+    if (cache_) {
+      cache_->shutdown();
+      cache_.reset();
+    }
+    allocator_.reset();
+    executor_.reset();
+  }
+
+  /// Creates a BufferedInput based on the test mode.
+  /// Returns nullptr for kNone mode.
+  velox::dwio::common::BufferedInput* createBufferedInput(
+      std::shared_ptr<velox::ReadFile> readFile) {
+    auto mode = GetParam();
+
+    auto& ids = velox::fileIds();
+    fileId_ = std::make_unique<velox::StringIdLease>(ids, "testFile");
+    groupId_ = std::make_unique<velox::StringIdLease>(ids, "testGroup");
+
+    velox::io::ReaderOptions readerOptions(pool_.get());
+
+    switch (mode) {
+      case BufferedInputMode::kNone:
+        return nullptr;
+
+      case BufferedInputMode::kBufferedInput:
+        bufferedInput_ = std::make_unique<velox::dwio::common::BufferedInput>(
+            readFile, *pool_);
+        return bufferedInput_.get();
+
+      case BufferedInputMode::kDirectBufferedInput:
+        tracker_ = std::make_shared<velox::cache::ScanTracker>(
+            "testTracker", nullptr, 256 << 10);
+        bufferedInput_ =
+            std::make_unique<velox::dwio::common::DirectBufferedInput>(
+                readFile,
+                velox::dwio::common::MetricsLog::voidLog(),
+                std::move(*fileId_),
+                tracker_,
+                std::move(*groupId_),
+                ioStatistics_,
+                nullptr,
+                executor_.get(),
+                readerOptions);
+        return bufferedInput_.get();
+
+      case BufferedInputMode::kCachedBufferedInput:
+        if (!allocator_) {
+          allocator_ = std::make_shared<velox::memory::MallocAllocator>(
+              velox::memory::MemoryAllocator::Options{
+                  .capacity = 1UL << 30, .reservationByteLimit = 0});
+        }
+        if (!cache_) {
+          cache_ = velox::cache::AsyncDataCache::create(allocator_.get());
+        }
+        tracker_ = std::make_shared<velox::cache::ScanTracker>(
+            "testTracker", nullptr, 256 << 10);
+        bufferedInput_ =
+            std::make_unique<velox::dwio::common::CachedBufferedInput>(
+                readFile,
+                velox::dwio::common::MetricsLog::voidLog(),
+                std::move(*fileId_),
+                cache_.get(),
+                tracker_,
+                std::move(*groupId_),
+                ioStatistics_,
+                nullptr,
+                executor_.get(),
+                readerOptions);
+        return bufferedInput_.get();
+    }
+    return nullptr;
+  }
+
+  bool expectHasCache() const {
+    return GetParam() == BufferedInputMode::kCachedBufferedInput;
+  }
+
+  /// Creates a TabletReader with BufferedInput configured based on test mode.
+  /// This is the primary method tests should use to create readers.
+  std::shared_ptr<nimble::TabletReader> createTabletReader(
+      std::shared_ptr<velox::ReadFile> readFile,
+      nimble::TabletReader::Options options = {}) {
+    readFile_ = readFile;
+    auto* bufferedInput = createBufferedInput(readFile_);
+    options.bufferedInput = bufferedInput;
+    return nimble::TabletReader::create(readFile_.get(), pool_.get(), options);
+  }
+
+  /// Overload for string file content (creates InMemoryReadFile internally).
+  std::shared_ptr<nimble::TabletReader> createTabletReader(
+      const std::string& fileContent,
+      nimble::TabletReader::Options options = {}) {
+    return createTabletReader(
+        std::make_shared<velox::InMemoryReadFile>(fileContent),
+        std::move(options));
+  }
+
+  std::shared_ptr<velox::ReadFile> readFile_;
+  std::unique_ptr<folly::CPUThreadPoolExecutor> executor_;
+  std::shared_ptr<velox::dwio::common::IoStatistics> ioStatistics_;
+  std::shared_ptr<velox::memory::MallocAllocator> allocator_;
+  std::shared_ptr<velox::cache::AsyncDataCache> cache_;
+  std::shared_ptr<velox::cache::ScanTracker> tracker_;
+  std::unique_ptr<velox::StringIdLease> fileId_;
+  std::unique_ptr<velox::StringIdLease> groupId_;
+  std::unique_ptr<velox::dwio::common::BufferedInput> bufferedInput_;
 
   // Runs a single write/read test using input parameters
   void parameterizedTest(
@@ -161,7 +313,7 @@ class TabletTest : public ::testing::Test {
       for (auto useChainedBuffers : {false, true}) {
         nimble::testing::InMemoryTrackableReadFile readFile(
             file, useChainedBuffers);
-        auto tablet = nimble::TabletReader::create(&readFile, *pool_);
+        auto tablet = nimble::TabletReader::create(&readFile, pool_.get(), {});
 
         // Get stripe group count through the read path
         nimble::test::TabletReaderTestHelper tabletHelper(tablet.get());
@@ -354,7 +506,8 @@ class TabletTest : public ::testing::Test {
       // Velidate checksum on a good file
       nimble::testing::InMemoryTrackableReadFile readFile(
           file, useChainedBuffers);
-      auto tablet = nimble::TabletReader::create(&readFile, *this->pool_);
+      auto tablet =
+          nimble::TabletReader::create(&readFile, this->pool_.get(), {});
       auto storedChecksum = tablet->checksum();
       EXPECT_EQ(
           storedChecksum,
@@ -633,12 +786,14 @@ class TabletTest : public ::testing::Test {
       rootPool_->addLeafChild("TabletTest")};
 };
 
-TEST_F(TabletTest, emptyWrite) {
+// --- TabletTest parameterized tests ---
+
+TEST_P(TabletTest, emptyWrite) {
   // Creating an Nimble file without writing any stripes
   test(/* stripes */ {});
 }
 
-TEST_F(TabletTest, writeDifferentStreamsPerStripe) {
+TEST_P(TabletTest, writeDifferentStreamsPerStripe) {
   // Write different subset of streams in each stripe
   test(
       /* stripes */
@@ -649,7 +804,7 @@ TEST_F(TabletTest, writeDifferentStreamsPerStripe) {
       });
 }
 
-TEST_F(TabletTest, checksumValidation) {
+TEST_P(TabletTest, checksumValidation) {
   std::vector<uint32_t> metadataCompressionThresholds{
       // use size 0 here so it will always force a footer compression
       0,
@@ -679,7 +834,7 @@ TEST_F(TabletTest, checksumValidation) {
   }
 }
 
-TEST_F(TabletTest, optionalSections) {
+TEST_P(TabletTest, optionalSections) {
   auto seed = folly::Random::rand32();
   LOG(INFO) << "seed: " << seed;
   std::mt19937 rng{seed};
@@ -728,7 +883,7 @@ TEST_F(TabletTest, optionalSections) {
   for (auto useChainedBuffers : {false, true}) {
     nimble::testing::InMemoryTrackableReadFile readFile(
         file, useChainedBuffers);
-    auto tablet = nimble::TabletReader::create(&readFile, *pool_);
+    auto tablet = nimble::TabletReader::create(&readFile, pool_.get(), {});
 
     ASSERT_EQ(tablet->optionalSections().size(), 4);
 
@@ -798,7 +953,7 @@ TEST_F(TabletTest, optionalSections) {
   }
 }
 
-TEST_F(TabletTest, optionalSectionsEmpty) {
+TEST_P(TabletTest, optionalSectionsEmpty) {
   std::string file;
   velox::InMemoryWriteFile writeFile(&file);
   auto tabletWriter = nimble::TabletWriter::create(&writeFile, *pool_, {});
@@ -808,7 +963,7 @@ TEST_F(TabletTest, optionalSectionsEmpty) {
   for (auto useChainedBuffers : {false, true}) {
     nimble::testing::InMemoryTrackableReadFile readFile(
         file, useChainedBuffers);
-    auto tablet = nimble::TabletReader::create(&readFile, *pool_);
+    auto tablet = nimble::TabletReader::create(&readFile, pool_.get(), {});
 
     ASSERT_TRUE(tablet->optionalSections().empty());
 
@@ -817,7 +972,7 @@ TEST_F(TabletTest, optionalSectionsEmpty) {
   }
 }
 
-TEST_F(TabletTest, hasOptionalSection) {
+TEST_P(TabletTest, hasOptionalSection) {
   std::string file;
   velox::InMemoryWriteFile writeFile(&file);
   auto tabletWriter = nimble::TabletWriter::create(&writeFile, *pool_, {});
@@ -830,7 +985,7 @@ TEST_F(TabletTest, hasOptionalSection) {
   tabletWriter->close();
 
   nimble::testing::InMemoryTrackableReadFile readFile(file, true);
-  auto tablet = nimble::TabletReader::create(&readFile, *pool_);
+  auto tablet = nimble::TabletReader::create(&readFile, pool_.get(), {});
 
   // Test that hasOptionalSection returns true for existing sections
   EXPECT_TRUE(tablet->hasOptionalSection("section1"));
@@ -841,10 +996,11 @@ TEST_F(TabletTest, hasOptionalSection) {
   EXPECT_FALSE(tablet->hasOptionalSection("section4"));
   EXPECT_FALSE(tablet->hasOptionalSection("nonexistent"));
   EXPECT_FALSE(tablet->hasOptionalSection(""));
-  EXPECT_FALSE(tablet->hasOptionalSection(std::string(nimble::kIndexSection)));
+  EXPECT_FALSE(
+      tablet->hasOptionalSection(std::string(nimble::kClusterIndexSection)));
 }
 
-TEST_F(TabletTest, hasOptionalSectionEmpty) {
+TEST_P(TabletTest, hasOptionalSectionEmpty) {
   std::string file;
   velox::InMemoryWriteFile writeFile(&file);
   auto tabletWriter = nimble::TabletWriter::create(&writeFile, *pool_, {});
@@ -852,7 +1008,7 @@ TEST_F(TabletTest, hasOptionalSectionEmpty) {
   tabletWriter->close();
 
   nimble::testing::InMemoryTrackableReadFile readFile(file, true);
-  auto tablet = nimble::TabletReader::create(&readFile, *pool_);
+  auto tablet = nimble::TabletReader::create(&readFile, pool_.get(), {});
 
   // Test that hasOptionalSection returns false when there are no sections
   EXPECT_FALSE(tablet->hasOptionalSection("section1"));
@@ -860,7 +1016,7 @@ TEST_F(TabletTest, hasOptionalSectionEmpty) {
   EXPECT_FALSE(tablet->hasOptionalSection("any_name"));
 }
 
-TEST_F(TabletTest, optionalSectionsPreload) {
+TEST_P(TabletTest, optionalSectionsPreload) {
   auto seed = folly::Random::rand32();
   LOG(INFO) << "seed: " << seed;
   std::mt19937 rng{seed};
@@ -892,7 +1048,10 @@ TEST_F(TabletTest, optionalSectionsPreload) {
       for (auto useChainedBuffers : {false, true}) {
         nimble::testing::InMemoryTrackableReadFile readFile(
             file, useChainedBuffers);
-        auto tablet = nimble::TabletReader::create(&readFile, *pool_, preload);
+        nimble::TabletReader::Options options;
+        options.preloadOptionalSections = preload;
+        auto tablet =
+            nimble::TabletReader::create(&readFile, pool_.get(), options);
 
         // Expecting only the initial footer read.
         ASSERT_EQ(expectedInitialReads, readFile.chunks().size());
@@ -1055,7 +1214,7 @@ class Guard {
   Actions& actions_;
 };
 
-TEST_F(TabletTest, referenceCountedCache) {
+TEST_P(TabletTest, referenceCountedCache) {
   Actions actions;
   facebook::nimble::ReferenceCountedCache<int, Guard> cache{
       [&](int id) { return std::make_shared<Guard>(id, actions); }};
@@ -1151,7 +1310,7 @@ TEST_F(TabletTest, referenceCountedCache) {
            {ActionEnum::kDestroyed, 0}}));
 }
 
-TEST_F(TabletTest, referenceCountedCacheStressParallelDuplicates) {
+TEST_P(TabletTest, referenceCountedCacheStressParallelDuplicates) {
   std::atomic_int counter{0};
   facebook::nimble::ReferenceCountedCache<int, int> cache{[&](int id) {
     ++counter;
@@ -1173,7 +1332,7 @@ TEST_F(TabletTest, referenceCountedCacheStressParallelDuplicates) {
   EXPECT_GE(counter.load(), kEntryIds);
 }
 
-TEST_F(TabletTest, referenceCountedCacheStressParallelDuplicatesSaveEntries) {
+TEST_P(TabletTest, referenceCountedCacheStressParallelDuplicatesSaveEntries) {
   std::atomic_int counter{0};
   facebook::nimble::ReferenceCountedCache<int, int> cache{[&](int id) {
     ++counter;
@@ -1197,7 +1356,7 @@ TEST_F(TabletTest, referenceCountedCacheStressParallelDuplicatesSaveEntries) {
   EXPECT_EQ(counter.load(), kEntryIds);
 }
 
-TEST_F(TabletTest, referenceCountedCacheStress) {
+TEST_P(TabletTest, referenceCountedCacheStress) {
   std::atomic_int counter{0};
   facebook::nimble::ReferenceCountedCache<int, int> cache{[&](int id) {
     ++counter;
@@ -1219,7 +1378,7 @@ TEST_F(TabletTest, referenceCountedCacheStress) {
   EXPECT_GE(counter.load(), kEntryIds);
 }
 
-TEST_F(TabletTest, referenceCountedCacheStressSaveEntries) {
+TEST_P(TabletTest, referenceCountedCacheStressSaveEntries) {
   std::atomic_int counter{0};
   facebook::nimble::ReferenceCountedCache<int, int> cache{[&](int id) {
     ++counter;
@@ -1243,7 +1402,7 @@ TEST_F(TabletTest, referenceCountedCacheStressSaveEntries) {
   EXPECT_EQ(counter.load(), kEntryIds);
 }
 
-TEST_F(TabletTest, deduplicateStreams) {
+TEST_P(TabletTest, deduplicateStreams) {
   auto seed = FLAGS_tablet_tests_seed > 0 ? FLAGS_tablet_tests_seed
                                           : folly::Random::rand32();
   LOG(INFO) << "seed: " << seed;
@@ -1258,7 +1417,7 @@ TEST_F(TabletTest, deduplicateStreams) {
   }
 }
 
-TEST_F(TabletTest, chunkContentSize) {
+TEST_P(TabletTest, chunkContentSize) {
   nimble::Chunk chunk;
   EXPECT_EQ(chunk.contentSize(), 0);
 
@@ -1276,7 +1435,7 @@ TEST_F(TabletTest, chunkContentSize) {
 // It inherits the memory pool and helper methods from TabletTest.
 class TabletWithIndexTest : public TabletTest {
  protected:
-  // Use shared test data structs from TabletIndexTestUtils.h
+  // Use shared test data structs from ClusterIndexTestUtils.h
   using ChunkSpec = nimble::index::test::ChunkSpec;
   using KeyChunkSpec = nimble::index::test::KeyChunkSpec;
   using StreamSpec = nimble::index::test::StreamSpec;
@@ -1289,7 +1448,7 @@ class TabletWithIndexTest : public TabletTest {
   };
 
   // Specification for key lookup verification through
-  // StripeIndexGroup::lookupChunk
+  // ClusterIndexGroup::lookupChunk
   struct KeyLookupTestCase {
     std::string key; // The key to look up
     uint32_t expectedStripeIndex; // Expected stripe index
@@ -1323,8 +1482,8 @@ class TabletWithIndexTest : public TabletTest {
   }
 
   // Helper to verify tablet index lookups
-  static void verifyTabletIndexLookups(
-      const nimble::TabletIndex* index,
+  static void verifyClusterIndexLookups(
+      const nimble::ClusterIndex* index,
       const std::vector<LookupTestCase>& testCases) {
     for (const auto& testCase : testCases) {
       auto location = index->lookup(testCase.key);
@@ -1353,16 +1512,15 @@ class TabletWithIndexTest : public TabletTest {
       uint32_t stripeIdx,
       uint32_t streamId,
       const nimble::index::test::StreamStats& streamStats) {
-    auto stripeIdentifier =
-        tablet.stripeIdentifier(stripeIdx, /*loadIndex=*/true);
+    auto stripeIdentifier = tablet.stripeIdentifier(stripeIdx);
 
-    ASSERT_NE(stripeIdentifier.indexGroup(), nullptr)
+    ASSERT_NE(stripeIdentifier.clusterIndex(), nullptr)
         << "Index group should be available for stripe " << stripeIdx;
     ASSERT_NE(stripeIdentifier.stripeGroup(), nullptr)
         << "Stripe group should be available for stripe " << stripeIdx;
 
-    nimble::index::test::StripeIndexGroupTestHelper indexGroupHelper(
-        stripeIdentifier.indexGroup().get());
+    nimble::index::test::ClusterIndexGroupTestHelper indexGroupHelper(
+        stripeIdentifier.clusterIndex().get());
 
     // Get stream sizes from stripe group metadata
     auto streamSizes = tablet.streamSizes(stripeIdentifier);
@@ -1414,7 +1572,7 @@ class TabletWithIndexTest : public TabletTest {
     }
   }
 
-  // Helper to verify key lookups through StripeIndexGroup::lookupChunk.
+  // Helper to verify key lookups through ClusterIndexGroup::lookupChunk.
   // This verifies that:
   // 1. Each key can be looked up through the index group
   // 2. The returned row offset within the stripe is correct
@@ -1436,15 +1594,14 @@ class TabletWithIndexTest : public TabletTest {
 
     for (const auto& testCase : testCases) {
       // Get stripe identifier with index loaded
-      auto stripeId = tablet.stripeIdentifier(
-          testCase.expectedStripeIndex, /*loadIndex=*/true);
-      ASSERT_NE(stripeId.indexGroup(), nullptr)
+      auto stripeId = tablet.stripeIdentifier(testCase.expectedStripeIndex);
+      ASSERT_NE(stripeId.clusterIndex(), nullptr)
           << "Index group should be available for stripe "
           << testCase.expectedStripeIndex << " when looking up key '"
           << testCase.key << "'";
 
       // Lookup chunk by encoded key
-      auto chunkLocation = stripeId.indexGroup()->lookupChunk(
+      auto chunkLocation = stripeId.clusterIndex()->lookupChunk(
           testCase.expectedStripeIndex, testCase.key);
       ASSERT_TRUE(chunkLocation.has_value())
           << "Key '" << testCase.key << "' should be found in stripe "
@@ -1465,14 +1622,12 @@ class TabletWithIndexTest : public TabletTest {
   }
 };
 
-TEST_F(TabletWithIndexTest, stripeIdentifier) {
-  // Test that stripeIdentifier correctly returns index group based on loadIndex
-  // parameter. When loadIndex=false (default), indexGroup should be nullptr.
-  // When loadIndex=true, indexGroup should be set.
+TEST_P(TabletWithIndexTest, stripeIdentifier) {
+  // Test that stripeIdentifier returns both stripe group and cluster index.
   std::string file;
   velox::InMemoryWriteFile writeFile(&file);
 
-  nimble::TabletIndexConfig indexConfig{
+  nimble::ClusterIndexConfig indexConfig{
       .columns = {"col1"},
       .sortOrders = {SortOrder{.ascending = true}},
       .enforceKeyOrder = true,
@@ -1499,28 +1654,17 @@ TEST_F(TabletWithIndexTest, stripeIdentifier) {
 
   // Read and verify
   auto tablet = nimble::TabletReader::create(
-      std::make_shared<velox::InMemoryReadFile>(file), *pool_);
+      std::make_shared<velox::InMemoryReadFile>(file), pool_.get(), {});
 
   ASSERT_EQ(tablet->stripeCount(), 1);
-  ASSERT_NE(tablet->index(), nullptr);
+  ASSERT_NE(tablet->clusterIndex(), nullptr);
 
-  // Test loadIndex parameter
-  for (bool loadIndex : {false, true}) {
-    SCOPED_TRACE(fmt::format("loadIndex={}", loadIndex));
-    auto stripeId = tablet->stripeIdentifier(0, loadIndex);
-    EXPECT_NE(stripeId.stripeGroup(), nullptr)
-        << "Stripe group should always be available";
-    if (loadIndex) {
-      EXPECT_NE(stripeId.indexGroup(), nullptr)
-          << "Index group should be set when loadIndex=true";
-    } else {
-      EXPECT_EQ(stripeId.indexGroup(), nullptr)
-          << "Index group should be nullptr when loadIndex=false";
-    }
-  }
+  auto stripeId = tablet->stripeIdentifier(0);
+  EXPECT_NE(stripeId.stripeGroup(), nullptr);
+  EXPECT_NE(stripeId.clusterIndex(), nullptr);
 }
 
-TEST_F(TabletWithIndexTest, singleGroup) {
+TEST_P(TabletWithIndexTest, singleGroup) {
   // Test writing a tablet with index configuration and reading it back.
   // Each stream has multiple chunks with varying row counts and sizes.
   // Different streams are not synchronized in chunk count, rows, or size.
@@ -1528,7 +1672,7 @@ TEST_F(TabletWithIndexTest, singleGroup) {
   std::string file;
   velox::InMemoryWriteFile writeFile(&file);
 
-  nimble::TabletIndexConfig indexConfig{
+  nimble::ClusterIndexConfig indexConfig{
       .columns = {"col1", "col2"},
       .sortOrders =
           {SortOrder{.ascending = true}, SortOrder{.ascending = true}},
@@ -1655,7 +1799,7 @@ TEST_F(TabletWithIndexTest, singleGroup) {
 
   // Read and verify the tablet
   nimble::testing::InMemoryTrackableReadFile readFile(file, false);
-  auto tablet = nimble::TabletReader::create(&readFile, *pool_);
+  auto tablet = nimble::TabletReader::create(&readFile, pool_.get(), {});
 
   // Use test helper to verify stripe group count through the read path
   nimble::test::TabletReaderTestHelper tabletHelper(tablet.get());
@@ -1669,10 +1813,11 @@ TEST_F(TabletWithIndexTest, singleGroup) {
   EXPECT_EQ(tablet->stripeRowCount(2), 150);
 
   // Verify index section exists
-  EXPECT_TRUE(tablet->hasOptionalSection(std::string(nimble::kIndexSection)));
+  EXPECT_TRUE(
+      tablet->hasOptionalSection(std::string(nimble::kClusterIndexSection)));
 
   // Verify the index is available
-  const nimble::TabletIndex* index = tablet->index();
+  const nimble::ClusterIndex* index = tablet->clusterIndex();
   ASSERT_NE(index, nullptr);
 
   // Verify only one index group is created
@@ -1708,7 +1853,7 @@ TEST_F(TabletWithIndexTest, singleGroup) {
   // - Stripe 1: covers ("ccc", "ggg"], keys: "ccc"->"ddd", "ddd"->"eee",
   //   "eee"->"fff", "fff"->"ggg"
   // - Stripe 2: covers ("ggg", "hhh"], keys: "ggg"->"hhh"
-  verifyTabletIndexLookups(
+  verifyClusterIndexLookups(
       index,
       {
           // Keys before minKey - should return nullopt
@@ -1769,27 +1914,23 @@ TEST_F(TabletWithIndexTest, singleGroup) {
           {"zzz", std::nullopt},
       });
 
-  // Verify stripeIdentifier with and without loadIndex
+  // Verify stripeIdentifier returns both stripe group and cluster index
   {
-    // Without loadIndex (default = false): indexGroup should be nullptr
-    auto stripeIdWithoutIndex = tablet->stripeIdentifier(0);
-    EXPECT_NE(stripeIdWithoutIndex.stripeGroup(), nullptr);
-    EXPECT_EQ(stripeIdWithoutIndex.indexGroup(), nullptr);
-    EXPECT_TRUE(tabletHelper.hasOnlyFirstIndexGroupCached());
-
-    // With loadIndex = true: indexGroup should be set
-    auto stripeIdWithIndex = tablet->stripeIdentifier(0, /*loadIndex=*/true);
+    auto stripeIdWithIndex = tablet->stripeIdentifier(0);
     EXPECT_NE(stripeIdWithIndex.stripeGroup(), nullptr);
-    EXPECT_NE(stripeIdWithIndex.indexGroup(), nullptr);
+    EXPECT_NE(stripeIdWithIndex.clusterIndex(), nullptr);
 
     // Verify the stripe index group content using test helper
-    nimble::index::test::StripeIndexGroupTestHelper indexGroupHelper(
-        stripeIdWithIndex.indexGroup().get());
+    nimble::index::test::ClusterIndexGroupTestHelper indexGroupHelper(
+        stripeIdWithIndex.clusterIndex().get());
     EXPECT_EQ(indexGroupHelper.groupIndex(), 0);
     EXPECT_EQ(indexGroupHelper.firstStripe(), 0);
     EXPECT_EQ(indexGroupHelper.stripeCount(), 3);
+
+    nimble::index::test::ChunkIndexTestHelper chunkHelper(
+        stripeIdWithIndex.chunkIndex().get());
     // We have 2 streams per stripe
-    EXPECT_EQ(indexGroupHelper.streamCount(), 2);
+    EXPECT_EQ(chunkHelper.streamCount(), 2);
 
     // Verify key stream stats persisted in the index
     // Stripe 0: 2 chunks (rows: 50, 50), keys: "aaa"->"bbb", "bbb"->"ccc"
@@ -1822,7 +1963,7 @@ TEST_F(TabletWithIndexTest, singleGroup) {
     // Stripe 1: 4 chunks (rows: 40, 55, 65, 40)
     // Stripe 2: 2 chunks (rows: 100, 50)
     {
-      auto stream0Stats = indexGroupHelper.streamStats(0);
+      auto stream0Stats = chunkHelper.streamStats(0);
 
       // Per-stream accumulated chunk counts:
       // Stripe 0: 3 chunks -> accumulated = 3
@@ -1844,7 +1985,7 @@ TEST_F(TabletWithIndexTest, singleGroup) {
     // Stripe 1: 1 chunk (rows: 200)
     // Stripe 2: 5 chunks (rows: 20, 35, 40, 25, 30)
     {
-      auto stream1Stats = indexGroupHelper.streamStats(1);
+      auto stream1Stats = chunkHelper.streamStats(1);
 
       // Per-stream accumulated chunk counts for stream 1:
       // Stripe 0: 2 chunks -> accumulated = 2
@@ -1860,30 +2001,24 @@ TEST_F(TabletWithIndexTest, singleGroup) {
           stream1Stats.chunkRows,
           (std::vector<uint32_t>{60, 100, 200, 20, 55, 95, 120, 150}));
     }
-
-    // With loadIndex = false: indexGroup should be nullptr
-    auto stripeIdExplicitFalse =
-        tablet->stripeIdentifier(1, /*loadIndex=*/false);
-    EXPECT_NE(stripeIdExplicitFalse.stripeGroup(), nullptr);
-    EXPECT_EQ(stripeIdExplicitFalse.indexGroup(), nullptr);
   }
   // Verify chunk offsets from index match actual stream positions
   // This tests the position index chunk offsets are correctly persisted
   // and can be used to locate chunks within streams
   {
     for (uint32_t stripeIdx = 0; stripeIdx < 3; ++stripeIdx) {
-      auto stripeId = tablet->stripeIdentifier(stripeIdx, /*loadIndex=*/true);
-      nimble::index::test::StripeIndexGroupTestHelper helper(
-          stripeId.indexGroup().get());
+      auto stripeId = tablet->stripeIdentifier(stripeIdx);
+      nimble::index::test::ChunkIndexTestHelper chunkHelper(
+          stripeId.chunkIndex().get());
       for (uint32_t streamId = 0; streamId < 2; ++streamId) {
-        auto streamStats = helper.streamStats(streamId);
+        auto streamStats = chunkHelper.streamStats(streamId);
         verifyStreamChunkStats(*tablet, stripeIdx, streamId, streamStats);
       }
     }
   }
   EXPECT_TRUE(tabletHelper.hasOnlyFirstIndexGroupCached());
 
-  // Verify key lookups through StripeIndexGroup::lookupChunk return correct
+  // Verify key lookups through ClusterIndexGroup::lookupChunk return correct
   // global row IDs.
   // Global row ID = stripe start row + row offset within stripe
   //
@@ -1939,7 +2074,7 @@ TEST_F(TabletWithIndexTest, singleGroup) {
       });
 }
 
-TEST_F(TabletWithIndexTest, multipleGroups) {
+TEST_P(TabletWithIndexTest, multipleGroups) {
   // Test writing a tablet with index configuration and multiple stripe groups.
   // With metadataFlushThreshold = 0, each stripe is in its own group:
   // - Group 0: stripe 0
@@ -1951,7 +2086,7 @@ TEST_F(TabletWithIndexTest, multipleGroups) {
   std::string file;
   velox::InMemoryWriteFile writeFile(&file);
 
-  nimble::TabletIndexConfig indexConfig{
+  nimble::ClusterIndexConfig indexConfig{
       .columns = {"col1", "col2"},
       .sortOrders =
           {SortOrder{.ascending = true}, SortOrder{.ascending = true}},
@@ -2076,7 +2211,7 @@ TEST_F(TabletWithIndexTest, multipleGroups) {
 
   // Read and verify the tablet
   nimble::testing::InMemoryTrackableReadFile readFile(file, false);
-  auto tablet = nimble::TabletReader::create(&readFile, *pool_);
+  auto tablet = nimble::TabletReader::create(&readFile, pool_.get(), {});
 
   // Use test helper to verify stripe group count
   nimble::test::TabletReaderTestHelper tabletHelper(tablet.get());
@@ -2090,10 +2225,11 @@ TEST_F(TabletWithIndexTest, multipleGroups) {
   EXPECT_EQ(tablet->stripeRowCount(2), 120);
 
   // Verify index section exists
-  EXPECT_TRUE(tablet->hasOptionalSection(std::string(nimble::kIndexSection)));
+  EXPECT_TRUE(
+      tablet->hasOptionalSection(std::string(nimble::kClusterIndexSection)));
 
   // Verify the index is available
-  const nimble::TabletIndex* index = tablet->index();
+  const nimble::ClusterIndex* index = tablet->clusterIndex();
   ASSERT_NE(index, nullptr);
 
   // Verify 3 index groups are created (one per stripe)
@@ -2118,7 +2254,7 @@ TEST_F(TabletWithIndexTest, multipleGroups) {
   EXPECT_EQ(index->maxKey(), "hhh");
 
   // Verify key lookups across all stripes and group boundaries
-  verifyTabletIndexLookups(
+  verifyClusterIndexLookups(
       index,
       {
           // Keys before minKey
@@ -2153,15 +2289,18 @@ TEST_F(TabletWithIndexTest, multipleGroups) {
   // Verify stripeIdentifier and index group structure for each group
   // Group 0: stripe 0 only
   {
-    auto stripeId = tablet->stripeIdentifier(0, /*loadIndex=*/true);
-    ASSERT_NE(stripeId.indexGroup(), nullptr);
+    auto stripeId = tablet->stripeIdentifier(0);
+    ASSERT_NE(stripeId.clusterIndex(), nullptr);
 
-    nimble::index::test::StripeIndexGroupTestHelper helper(
-        stripeId.indexGroup().get());
+    nimble::index::test::ClusterIndexGroupTestHelper helper(
+        stripeId.clusterIndex().get());
     EXPECT_EQ(helper.groupIndex(), 0);
     EXPECT_EQ(helper.firstStripe(), 0);
     EXPECT_EQ(helper.stripeCount(), 1);
-    EXPECT_EQ(helper.streamCount(), 2);
+
+    nimble::index::test::ChunkIndexTestHelper chunkHelper(
+        stripeId.chunkIndex().get());
+    EXPECT_EQ(chunkHelper.streamCount(), 2);
 
     // Verify key stream stats for group 0
     const auto keyStats = helper.keyStreamStats();
@@ -2170,27 +2309,30 @@ TEST_F(TabletWithIndexTest, multipleGroups) {
     EXPECT_EQ(keyStats.chunkKeys, (std::vector<std::string>{"bbb", "ccc"}));
 
     // Verify stream 0 stats for group 0: 2 chunks (rows: 50, 50)
-    auto stream0Stats = helper.streamStats(0);
+    auto stream0Stats = chunkHelper.streamStats(0);
     EXPECT_EQ(stream0Stats.chunkCounts, (std::vector<uint32_t>{2}));
     EXPECT_EQ(stream0Stats.chunkRows, (std::vector<uint32_t>{50, 100}));
 
     // Verify stream 1 stats for group 0: 3 chunks (rows: 30, 40, 30)
-    auto stream1Stats = helper.streamStats(1);
+    auto stream1Stats = chunkHelper.streamStats(1);
     EXPECT_EQ(stream1Stats.chunkCounts, (std::vector<uint32_t>{3}));
     EXPECT_EQ(stream1Stats.chunkRows, (std::vector<uint32_t>{30, 70, 100}));
   }
 
   // Group 1: stripe 1 only
   {
-    auto stripeId = tablet->stripeIdentifier(1, /*loadIndex=*/true);
-    ASSERT_NE(stripeId.indexGroup(), nullptr);
+    auto stripeId = tablet->stripeIdentifier(1);
+    ASSERT_NE(stripeId.clusterIndex(), nullptr);
 
-    nimble::index::test::StripeIndexGroupTestHelper helper(
-        stripeId.indexGroup().get());
+    nimble::index::test::ClusterIndexGroupTestHelper helper(
+        stripeId.clusterIndex().get());
     EXPECT_EQ(helper.groupIndex(), 1);
     EXPECT_EQ(helper.firstStripe(), 1);
     EXPECT_EQ(helper.stripeCount(), 1);
-    EXPECT_EQ(helper.streamCount(), 2);
+
+    nimble::index::test::ChunkIndexTestHelper chunkHelper(
+        stripeId.chunkIndex().get());
+    EXPECT_EQ(chunkHelper.streamCount(), 2);
 
     // Verify key stream stats for group 1
     // Stripe 1: 3 chunks
@@ -2202,28 +2344,31 @@ TEST_F(TabletWithIndexTest, multipleGroups) {
 
     // Verify stream 0 stats for group 1
     // Stripe 1: 3 chunks (rows: 40, 60, 50)
-    auto stream0Stats = helper.streamStats(0);
+    auto stream0Stats = chunkHelper.streamStats(0);
     EXPECT_EQ(stream0Stats.chunkCounts, (std::vector<uint32_t>{3}));
     EXPECT_EQ(stream0Stats.chunkRows, (std::vector<uint32_t>{40, 100, 150}));
 
     // Verify stream 1 stats for group 1
     // Stripe 1: 2 chunks (rows: 80, 70)
-    auto stream1Stats = helper.streamStats(1);
+    auto stream1Stats = chunkHelper.streamStats(1);
     EXPECT_EQ(stream1Stats.chunkCounts, (std::vector<uint32_t>{2}));
     EXPECT_EQ(stream1Stats.chunkRows, (std::vector<uint32_t>{80, 150}));
   }
 
   // Group 2: stripe 2 only
   {
-    auto stripeId = tablet->stripeIdentifier(2, /*loadIndex=*/true);
-    ASSERT_NE(stripeId.indexGroup(), nullptr);
+    auto stripeId = tablet->stripeIdentifier(2);
+    ASSERT_NE(stripeId.clusterIndex(), nullptr);
 
-    nimble::index::test::StripeIndexGroupTestHelper helper(
-        stripeId.indexGroup().get());
+    nimble::index::test::ClusterIndexGroupTestHelper helper(
+        stripeId.clusterIndex().get());
     EXPECT_EQ(helper.groupIndex(), 2);
     EXPECT_EQ(helper.firstStripe(), 2);
     EXPECT_EQ(helper.stripeCount(), 1);
-    EXPECT_EQ(helper.streamCount(), 2);
+
+    nimble::index::test::ChunkIndexTestHelper chunkHelper(
+        stripeId.chunkIndex().get());
+    EXPECT_EQ(chunkHelper.streamCount(), 2);
 
     // Verify key stream stats for group 2
     // Stripe 2: 2 chunks
@@ -2234,13 +2379,13 @@ TEST_F(TabletWithIndexTest, multipleGroups) {
 
     // Verify stream 0 stats for group 2
     // Stripe 2: 2 chunks (rows: 70, 50)
-    auto stream0Stats = helper.streamStats(0);
+    auto stream0Stats = chunkHelper.streamStats(0);
     EXPECT_EQ(stream0Stats.chunkCounts, (std::vector<uint32_t>{2}));
     EXPECT_EQ(stream0Stats.chunkRows, (std::vector<uint32_t>{70, 120}));
 
     // Verify stream 1 stats for group 2
     // Stripe 2: 4 chunks (rows: 25, 35, 30, 30)
-    auto stream1Stats = helper.streamStats(1);
+    auto stream1Stats = chunkHelper.streamStats(1);
     EXPECT_EQ(stream1Stats.chunkCounts, (std::vector<uint32_t>{4}));
     EXPECT_EQ(stream1Stats.chunkRows, (std::vector<uint32_t>{25, 60, 90, 120}));
   }
@@ -2249,17 +2394,17 @@ TEST_F(TabletWithIndexTest, multipleGroups) {
   // Test across all stripes in all groups
   {
     for (uint32_t stripeIdx = 0; stripeIdx < 3; ++stripeIdx) {
-      auto stripeId = tablet->stripeIdentifier(stripeIdx, /*loadIndex=*/true);
-      nimble::index::test::StripeIndexGroupTestHelper helper(
-          stripeId.indexGroup().get());
+      auto stripeId = tablet->stripeIdentifier(stripeIdx);
+      nimble::index::test::ChunkIndexTestHelper chunkHelper(
+          stripeId.chunkIndex().get());
       for (uint32_t streamId = 0; streamId < 2; ++streamId) {
-        auto streamStats = helper.streamStats(streamId);
+        auto streamStats = chunkHelper.streamStats(streamId);
         verifyStreamChunkStats(*tablet, stripeIdx, streamId, streamStats);
       }
     }
   }
 
-  // Verify key lookups through StripeIndexGroup::lookupChunk return correct
+  // Verify key lookups through ClusterIndexGroup::lookupChunk return correct
   // global row IDs.
   // Global row ID = stripe start row + row offset within stripe
   //
@@ -2314,7 +2459,7 @@ TEST_F(TabletWithIndexTest, multipleGroups) {
       });
 }
 
-TEST_F(TabletWithIndexTest, singleGroupWithEmptyStream) {
+TEST_P(TabletWithIndexTest, singleGroupWithEmptyStream) {
   // Test writing a tablet with 4 streams where some streams are empty in
   // certain stripes. This tests the position index handles missing streams
   // correctly.
@@ -2328,7 +2473,7 @@ TEST_F(TabletWithIndexTest, singleGroupWithEmptyStream) {
   std::string file;
   velox::InMemoryWriteFile writeFile(&file);
 
-  nimble::TabletIndexConfig indexConfig{
+  nimble::ClusterIndexConfig indexConfig{
       .columns = {"col1"},
       .sortOrders = {SortOrder{.ascending = true}},
       .enforceKeyOrder = true,
@@ -2525,7 +2670,7 @@ TEST_F(TabletWithIndexTest, singleGroupWithEmptyStream) {
 
   // Read and verify the tablet
   nimble::testing::InMemoryTrackableReadFile readFile(file, false);
-  auto tablet = nimble::TabletReader::create(&readFile, *pool_);
+  auto tablet = nimble::TabletReader::create(&readFile, pool_.get(), {});
 
   // Use test helper to verify stripe group count
   nimble::test::TabletReaderTestHelper tabletHelper(tablet.get());
@@ -2540,25 +2685,29 @@ TEST_F(TabletWithIndexTest, singleGroupWithEmptyStream) {
   EXPECT_EQ(tablet->stripeRowCount(3), 100);
 
   // Verify index section exists
-  EXPECT_TRUE(tablet->hasOptionalSection(std::string(nimble::kIndexSection)));
+  EXPECT_TRUE(
+      tablet->hasOptionalSection(std::string(nimble::kClusterIndexSection)));
 
   // Verify the index is available
-  const nimble::TabletIndex* index = tablet->index();
+  const nimble::ClusterIndex* index = tablet->clusterIndex();
   ASSERT_NE(index, nullptr);
 
   // Verify only one index group is created
   EXPECT_EQ(index->numIndexGroups(), 1);
 
   // Load index group and verify stream stats
-  auto stripeId = tablet->stripeIdentifier(0, /*loadIndex=*/true);
-  ASSERT_NE(stripeId.indexGroup(), nullptr);
+  auto stripeId = tablet->stripeIdentifier(0);
+  ASSERT_NE(stripeId.clusterIndex(), nullptr);
 
-  nimble::index::test::StripeIndexGroupTestHelper helper(
-      stripeId.indexGroup().get());
+  nimble::index::test::ClusterIndexGroupTestHelper helper(
+      stripeId.clusterIndex().get());
   EXPECT_EQ(helper.groupIndex(), 0);
   EXPECT_EQ(helper.firstStripe(), 0);
   EXPECT_EQ(helper.stripeCount(), 4);
-  EXPECT_EQ(helper.streamCount(), 4);
+
+  nimble::index::test::ChunkIndexTestHelper chunkHelper(
+      stripeId.chunkIndex().get());
+  EXPECT_EQ(chunkHelper.streamCount(), 4);
 
   // Verify stream 0 position index stats (empty in stripe 0)
   // Stripe 0: 0 chunks (empty)
@@ -2566,7 +2715,7 @@ TEST_F(TabletWithIndexTest, singleGroupWithEmptyStream) {
   // Stripe 2: 2 chunks (rows: 70, 50)
   // Stripe 3: 2 chunks (rows: 50, 50)
   {
-    auto stream0Stats = helper.streamStats(0);
+    auto stream0Stats = chunkHelper.streamStats(0);
     // Per-stream accumulated chunk counts:
     // Stripe 0: 0 chunks -> accumulated = 0
     // Stripe 1: 3 chunks -> accumulated = 0 + 3 = 3
@@ -2588,7 +2737,7 @@ TEST_F(TabletWithIndexTest, singleGroupWithEmptyStream) {
   // Stripe 2: 4 chunks (rows: 25, 35, 30, 30)
   // Stripe 3: 2 chunks (rows: 40, 60)
   {
-    auto stream1Stats = helper.streamStats(1);
+    auto stream1Stats = chunkHelper.streamStats(1);
     // Per-stream accumulated chunk counts:
     // Stripe 0: 2 chunks -> accumulated = 2
     // Stripe 1: 0 chunks -> accumulated = 2 + 0 = 2
@@ -2611,7 +2760,7 @@ TEST_F(TabletWithIndexTest, singleGroupWithEmptyStream) {
   // Stripe 2: 0 chunks (empty)
   // Stripe 3: 1 chunk (rows: 100)
   {
-    auto stream2Stats = helper.streamStats(2);
+    auto stream2Stats = chunkHelper.streamStats(2);
     // Per-stream accumulated chunk counts:
     // Stripe 0: 3 chunks -> accumulated = 3
     // Stripe 1: 2 chunks -> accumulated = 3 + 2 = 5
@@ -2634,7 +2783,7 @@ TEST_F(TabletWithIndexTest, singleGroupWithEmptyStream) {
   // Stripe 2: 3 chunks (rows: 40, 40, 40)
   // Stripe 3: 2 chunks (rows: 30, 70)
   {
-    auto stream3Stats = helper.streamStats(3);
+    auto stream3Stats = chunkHelper.streamStats(3);
     // Per-stream accumulated chunk counts:
     // Stripe 0: 2 chunks -> accumulated = 2
     // Stripe 1: 1 chunk -> accumulated = 2 + 1 = 3
@@ -2666,7 +2815,7 @@ TEST_F(TabletWithIndexTest, singleGroupWithEmptyStream) {
   }
 
   // Verify key lookups
-  verifyTabletIndexLookups(
+  verifyClusterIndexLookups(
       index,
       {
           {"aaa", 0},
@@ -2682,7 +2831,7 @@ TEST_F(TabletWithIndexTest, singleGroupWithEmptyStream) {
           {"kkk", std::nullopt},
       });
 
-  // Verify key lookups through StripeIndexGroup::lookupChunk return correct
+  // Verify key lookups through ClusterIndexGroup::lookupChunk return correct
   // global row IDs.
   // Global row ID = stripe start row + row offset within stripe
   //
@@ -2728,7 +2877,7 @@ TEST_F(TabletWithIndexTest, singleGroupWithEmptyStream) {
       });
 }
 
-TEST_F(TabletWithIndexTest, multipleGroupsWithEmptyStream) {
+TEST_P(TabletWithIndexTest, multipleGroupsWithEmptyStream) {
   // Test writing a tablet with 4 streams where some streams are empty in
   // certain stripes, with multiple stripe groups (one per stripe).
   // This tests the position index handles missing streams correctly across
@@ -2743,7 +2892,7 @@ TEST_F(TabletWithIndexTest, multipleGroupsWithEmptyStream) {
   std::string file;
   velox::InMemoryWriteFile writeFile(&file);
 
-  nimble::TabletIndexConfig indexConfig{
+  nimble::ClusterIndexConfig indexConfig{
       .columns = {"col1"},
       .sortOrders = {SortOrder{.ascending = true}},
       .enforceKeyOrder = true,
@@ -2756,6 +2905,9 @@ TEST_F(TabletWithIndexTest, multipleGroupsWithEmptyStream) {
           // Set threshold to 0 to force flush after every stripe
           .metadataFlushThreshold = 0,
           .streamDeduplicationEnabled = false,
+          // Disable chunk index skipping so all groups get a chunk index,
+          // even when empty streams reduce the average chunks per stream.
+          .chunkIndexMinAvgChunks = 0,
           .indexConfig = indexConfig,
       });
 
@@ -2940,7 +3092,7 @@ TEST_F(TabletWithIndexTest, multipleGroupsWithEmptyStream) {
 
   // Read and verify the tablet
   nimble::testing::InMemoryTrackableReadFile readFile(file, false);
-  auto tablet = nimble::TabletReader::create(&readFile, *pool_);
+  auto tablet = nimble::TabletReader::create(&readFile, pool_.get(), {});
 
   // Use test helper to verify stripe group count
   nimble::test::TabletReaderTestHelper tabletHelper(tablet.get());
@@ -2955,17 +3107,18 @@ TEST_F(TabletWithIndexTest, multipleGroupsWithEmptyStream) {
   EXPECT_EQ(tablet->stripeRowCount(3), 100);
 
   // Verify index section exists
-  EXPECT_TRUE(tablet->hasOptionalSection(std::string(nimble::kIndexSection)));
+  EXPECT_TRUE(
+      tablet->hasOptionalSection(std::string(nimble::kClusterIndexSection)));
 
   // Verify the index is available
-  const nimble::TabletIndex* index = tablet->index();
+  const nimble::ClusterIndex* index = tablet->clusterIndex();
   ASSERT_NE(index, nullptr);
 
   // Verify 4 index groups are created (one per stripe)
   EXPECT_EQ(index->numIndexGroups(), 4);
 
   // Verify key lookups across all stripes and group boundaries
-  verifyTabletIndexLookups(
+  verifyClusterIndexLookups(
       index,
       {
           {"aaa", 0},
@@ -2987,15 +3140,19 @@ TEST_F(TabletWithIndexTest, multipleGroupsWithEmptyStream) {
   // Stream 2: 3 chunks (rows: 30, 40, 30)
   // Stream 3: 2 chunks (rows: 60, 40)
   {
-    auto stripeId = tablet->stripeIdentifier(0, /*loadIndex=*/true);
-    ASSERT_NE(stripeId.indexGroup(), nullptr);
+    auto stripeId = tablet->stripeIdentifier(0);
+    ASSERT_NE(stripeId.clusterIndex(), nullptr);
 
-    nimble::index::test::StripeIndexGroupTestHelper helper(
-        stripeId.indexGroup().get());
+    nimble::index::test::ClusterIndexGroupTestHelper helper(
+        stripeId.clusterIndex().get());
     EXPECT_EQ(helper.groupIndex(), 0);
     EXPECT_EQ(helper.firstStripe(), 0);
     EXPECT_EQ(helper.stripeCount(), 1);
-    EXPECT_EQ(helper.streamCount(), 4);
+
+    nimble::index::test::ChunkIndexTestHelper chunkHelper(
+        stripeId.chunkIndex().get());
+    // All 4 streams indexed (chunkIndexMinAvgChunks = 0).
+    EXPECT_EQ(chunkHelper.streamCount(), 4);
 
     // Verify key stream stats for group 0
     const auto keyStats = helper.keyStreamStats();
@@ -3003,23 +3160,23 @@ TEST_F(TabletWithIndexTest, multipleGroupsWithEmptyStream) {
     EXPECT_EQ(keyStats.chunkRows, (std::vector<uint32_t>{50, 100}));
     EXPECT_EQ(keyStats.chunkKeys, (std::vector<std::string>{"bbb", "ccc"}));
 
-    // Stream 0: EMPTY in this group
-    auto stream0Stats = helper.streamStats(0);
+    // Stream 0: EMPTY → 0 chunks.
+    auto stream0Stats = chunkHelper.streamStats(0);
     EXPECT_EQ(stream0Stats.chunkCounts, (std::vector<uint32_t>{0}));
     EXPECT_TRUE(stream0Stats.chunkRows.empty());
 
     // Stream 1: 2 chunks (rows: 50, 50)
-    auto stream1Stats = helper.streamStats(1);
+    auto stream1Stats = chunkHelper.streamStats(1);
     EXPECT_EQ(stream1Stats.chunkCounts, (std::vector<uint32_t>{2}));
     EXPECT_EQ(stream1Stats.chunkRows, (std::vector<uint32_t>{50, 100}));
 
     // Stream 2: 3 chunks (rows: 30, 40, 30)
-    auto stream2Stats = helper.streamStats(2);
+    auto stream2Stats = chunkHelper.streamStats(2);
     EXPECT_EQ(stream2Stats.chunkCounts, (std::vector<uint32_t>{3}));
     EXPECT_EQ(stream2Stats.chunkRows, (std::vector<uint32_t>{30, 70, 100}));
 
     // Stream 3: 2 chunks (rows: 60, 40)
-    auto stream3Stats = helper.streamStats(3);
+    auto stream3Stats = chunkHelper.streamStats(3);
     EXPECT_EQ(stream3Stats.chunkCounts, (std::vector<uint32_t>{2}));
     EXPECT_EQ(stream3Stats.chunkRows, (std::vector<uint32_t>{60, 100}));
   }
@@ -3030,15 +3187,19 @@ TEST_F(TabletWithIndexTest, multipleGroupsWithEmptyStream) {
   // Stream 2: 2 chunks (rows: 80, 70)
   // Stream 3: 1 chunk (rows: 150)
   {
-    auto stripeId = tablet->stripeIdentifier(1, /*loadIndex=*/true);
-    ASSERT_NE(stripeId.indexGroup(), nullptr);
+    auto stripeId = tablet->stripeIdentifier(1);
+    ASSERT_NE(stripeId.clusterIndex(), nullptr);
 
-    nimble::index::test::StripeIndexGroupTestHelper helper(
-        stripeId.indexGroup().get());
+    nimble::index::test::ClusterIndexGroupTestHelper helper(
+        stripeId.clusterIndex().get());
     EXPECT_EQ(helper.groupIndex(), 1);
     EXPECT_EQ(helper.firstStripe(), 1);
     EXPECT_EQ(helper.stripeCount(), 1);
-    EXPECT_EQ(helper.streamCount(), 4);
+
+    nimble::index::test::ChunkIndexTestHelper chunkHelper(
+        stripeId.chunkIndex().get());
+    // All 4 streams indexed (chunkIndexMinAvgChunks = 0).
+    EXPECT_EQ(chunkHelper.streamCount(), 4);
 
     // Verify key stream stats for group 1
     const auto keyStats = helper.keyStreamStats();
@@ -3048,22 +3209,22 @@ TEST_F(TabletWithIndexTest, multipleGroupsWithEmptyStream) {
         keyStats.chunkKeys, (std::vector<std::string>{"ddd", "eee", "fff"}));
 
     // Stream 0: 3 chunks (rows: 40, 60, 50)
-    auto stream0Stats = helper.streamStats(0);
+    auto stream0Stats = chunkHelper.streamStats(0);
     EXPECT_EQ(stream0Stats.chunkCounts, (std::vector<uint32_t>{3}));
     EXPECT_EQ(stream0Stats.chunkRows, (std::vector<uint32_t>{40, 100, 150}));
 
-    // Stream 1: EMPTY in this group
-    auto stream1Stats = helper.streamStats(1);
+    // Stream 1: EMPTY → 0 chunks.
+    auto stream1Stats = chunkHelper.streamStats(1);
     EXPECT_EQ(stream1Stats.chunkCounts, (std::vector<uint32_t>{0}));
     EXPECT_TRUE(stream1Stats.chunkRows.empty());
 
     // Stream 2: 2 chunks (rows: 80, 70)
-    auto stream2Stats = helper.streamStats(2);
+    auto stream2Stats = chunkHelper.streamStats(2);
     EXPECT_EQ(stream2Stats.chunkCounts, (std::vector<uint32_t>{2}));
     EXPECT_EQ(stream2Stats.chunkRows, (std::vector<uint32_t>{80, 150}));
 
     // Stream 3: 1 chunk (rows: 150)
-    auto stream3Stats = helper.streamStats(3);
+    auto stream3Stats = chunkHelper.streamStats(3);
     EXPECT_EQ(stream3Stats.chunkCounts, (std::vector<uint32_t>{1}));
     EXPECT_EQ(stream3Stats.chunkRows, (std::vector<uint32_t>{150}));
   }
@@ -3074,15 +3235,19 @@ TEST_F(TabletWithIndexTest, multipleGroupsWithEmptyStream) {
   // Stream 2: EMPTY
   // Stream 3: 3 chunks (rows: 40, 40, 40)
   {
-    auto stripeId = tablet->stripeIdentifier(2, /*loadIndex=*/true);
-    ASSERT_NE(stripeId.indexGroup(), nullptr);
+    auto stripeId = tablet->stripeIdentifier(2);
+    ASSERT_NE(stripeId.clusterIndex(), nullptr);
 
-    nimble::index::test::StripeIndexGroupTestHelper helper(
-        stripeId.indexGroup().get());
+    nimble::index::test::ClusterIndexGroupTestHelper helper(
+        stripeId.clusterIndex().get());
     EXPECT_EQ(helper.groupIndex(), 2);
     EXPECT_EQ(helper.firstStripe(), 2);
     EXPECT_EQ(helper.stripeCount(), 1);
-    EXPECT_EQ(helper.streamCount(), 4);
+
+    nimble::index::test::ChunkIndexTestHelper chunkHelper(
+        stripeId.chunkIndex().get());
+    // All 4 streams indexed (chunkIndexMinAvgChunks = 0).
+    EXPECT_EQ(chunkHelper.streamCount(), 4);
 
     // Verify key stream stats for group 2
     const auto keyStats = helper.keyStreamStats();
@@ -3091,22 +3256,22 @@ TEST_F(TabletWithIndexTest, multipleGroupsWithEmptyStream) {
     EXPECT_EQ(keyStats.chunkKeys, (std::vector<std::string>{"ggg", "hhh"}));
 
     // Stream 0: 2 chunks (rows: 70, 50)
-    auto stream0Stats = helper.streamStats(0);
+    auto stream0Stats = chunkHelper.streamStats(0);
     EXPECT_EQ(stream0Stats.chunkCounts, (std::vector<uint32_t>{2}));
     EXPECT_EQ(stream0Stats.chunkRows, (std::vector<uint32_t>{70, 120}));
 
     // Stream 1: 4 chunks (rows: 25, 35, 30, 30)
-    auto stream1Stats = helper.streamStats(1);
+    auto stream1Stats = chunkHelper.streamStats(1);
     EXPECT_EQ(stream1Stats.chunkCounts, (std::vector<uint32_t>{4}));
     EXPECT_EQ(stream1Stats.chunkRows, (std::vector<uint32_t>{25, 60, 90, 120}));
 
-    // Stream 2: EMPTY in this group
-    auto stream2Stats = helper.streamStats(2);
+    // Stream 2: EMPTY → 0 chunks.
+    auto stream2Stats = chunkHelper.streamStats(2);
     EXPECT_EQ(stream2Stats.chunkCounts, (std::vector<uint32_t>{0}));
     EXPECT_TRUE(stream2Stats.chunkRows.empty());
 
     // Stream 3: 3 chunks (rows: 40, 40, 40)
-    auto stream3Stats = helper.streamStats(3);
+    auto stream3Stats = chunkHelper.streamStats(3);
     EXPECT_EQ(stream3Stats.chunkCounts, (std::vector<uint32_t>{3}));
     EXPECT_EQ(stream3Stats.chunkRows, (std::vector<uint32_t>{40, 80, 120}));
   }
@@ -3117,15 +3282,19 @@ TEST_F(TabletWithIndexTest, multipleGroupsWithEmptyStream) {
   // Stream 2: 1 chunk (rows: 100)
   // Stream 3: 2 chunks (rows: 30, 70)
   {
-    auto stripeId = tablet->stripeIdentifier(3, /*loadIndex=*/true);
-    ASSERT_NE(stripeId.indexGroup(), nullptr);
+    auto stripeId = tablet->stripeIdentifier(3);
+    ASSERT_NE(stripeId.clusterIndex(), nullptr);
 
-    nimble::index::test::StripeIndexGroupTestHelper helper(
-        stripeId.indexGroup().get());
+    nimble::index::test::ClusterIndexGroupTestHelper helper(
+        stripeId.clusterIndex().get());
     EXPECT_EQ(helper.groupIndex(), 3);
     EXPECT_EQ(helper.firstStripe(), 3);
     EXPECT_EQ(helper.stripeCount(), 1);
-    EXPECT_EQ(helper.streamCount(), 4);
+
+    nimble::index::test::ChunkIndexTestHelper chunkHelper(
+        stripeId.chunkIndex().get());
+    // All 4 streams indexed (chunkIndexMinAvgChunks = 0).
+    EXPECT_EQ(chunkHelper.streamCount(), 4);
 
     // Verify key stream stats for group 3
     const auto keyStats = helper.keyStreamStats();
@@ -3134,27 +3303,27 @@ TEST_F(TabletWithIndexTest, multipleGroupsWithEmptyStream) {
     EXPECT_EQ(keyStats.chunkKeys, (std::vector<std::string>{"iii", "jjj"}));
 
     // Stream 0: 2 chunks (rows: 50, 50)
-    auto stream0Stats = helper.streamStats(0);
+    auto stream0Stats = chunkHelper.streamStats(0);
     EXPECT_EQ(stream0Stats.chunkCounts, (std::vector<uint32_t>{2}));
     EXPECT_EQ(stream0Stats.chunkRows, (std::vector<uint32_t>{50, 100}));
 
     // Stream 1: 2 chunks (rows: 40, 60)
-    auto stream1Stats = helper.streamStats(1);
+    auto stream1Stats = chunkHelper.streamStats(1);
     EXPECT_EQ(stream1Stats.chunkCounts, (std::vector<uint32_t>{2}));
     EXPECT_EQ(stream1Stats.chunkRows, (std::vector<uint32_t>{40, 100}));
 
     // Stream 2: 1 chunk (rows: 100)
-    auto stream2Stats = helper.streamStats(2);
+    auto stream2Stats = chunkHelper.streamStats(2);
     EXPECT_EQ(stream2Stats.chunkCounts, (std::vector<uint32_t>{1}));
     EXPECT_EQ(stream2Stats.chunkRows, (std::vector<uint32_t>{100}));
 
     // Stream 3: 2 chunks (rows: 30, 70)
-    auto stream3Stats = helper.streamStats(3);
+    auto stream3Stats = chunkHelper.streamStats(3);
     EXPECT_EQ(stream3Stats.chunkCounts, (std::vector<uint32_t>{2}));
     EXPECT_EQ(stream3Stats.chunkRows, (std::vector<uint32_t>{30, 100}));
   }
 
-  // Verify key lookups through StripeIndexGroup::lookupChunk return correct
+  // Verify key lookups through ClusterIndexGroup::lookupChunk return correct
   // file row IDs.
   // File row ID = stripe start row + row offset within stripe
   //
@@ -3200,7 +3369,7 @@ TEST_F(TabletWithIndexTest, multipleGroupsWithEmptyStream) {
       });
 }
 
-TEST_F(TabletWithIndexTest, streamDeduplication) {
+TEST_P(TabletWithIndexTest, streamDeduplication) {
   // Test writing a tablet with stream deduplication enabled and index
   // configuration. Some streams have identical content and should be
   // deduplicated. This test verifies the position index correctly handles
@@ -3216,7 +3385,7 @@ TEST_F(TabletWithIndexTest, streamDeduplication) {
   std::string file;
   velox::InMemoryWriteFile writeFile(&file);
 
-  nimble::TabletIndexConfig indexConfig{
+  nimble::ClusterIndexConfig indexConfig{
       .columns = {"col1"},
       .sortOrders = {SortOrder{.ascending = true}},
       .enforceKeyOrder = true,
@@ -3353,7 +3522,7 @@ TEST_F(TabletWithIndexTest, streamDeduplication) {
 
   // Read and verify the tablet
   nimble::testing::InMemoryTrackableReadFile readFile(file, false);
-  auto tablet = nimble::TabletReader::create(&readFile, *pool_);
+  auto tablet = nimble::TabletReader::create(&readFile, pool_.get(), {});
 
   // Use test helper to verify stripe group count
   nimble::test::TabletReaderTestHelper tabletHelper(tablet.get());
@@ -3365,17 +3534,18 @@ TEST_F(TabletWithIndexTest, streamDeduplication) {
   EXPECT_EQ(tablet->stripeRowCount(0), 100);
 
   // Verify index section exists
-  EXPECT_TRUE(tablet->hasOptionalSection(std::string(nimble::kIndexSection)));
+  EXPECT_TRUE(
+      tablet->hasOptionalSection(std::string(nimble::kClusterIndexSection)));
 
   // Verify the index is available
-  const nimble::TabletIndex* index = tablet->index();
+  const nimble::ClusterIndex* index = tablet->clusterIndex();
   ASSERT_NE(index, nullptr);
 
   // Verify only one index group is created
   EXPECT_EQ(index->numIndexGroups(), 1);
 
   // Verify key lookups
-  verifyTabletIndexLookups(
+  verifyClusterIndexLookups(
       index,
       {
           {"aaa", 0},
@@ -3385,15 +3555,18 @@ TEST_F(TabletWithIndexTest, streamDeduplication) {
       });
 
   // Load index group and verify stream stats
-  auto stripeId = tablet->stripeIdentifier(0, /*loadIndex=*/true);
-  ASSERT_NE(stripeId.indexGroup(), nullptr);
+  auto stripeId = tablet->stripeIdentifier(0);
+  ASSERT_NE(stripeId.clusterIndex(), nullptr);
 
-  nimble::index::test::StripeIndexGroupTestHelper helper(
-      stripeId.indexGroup().get());
+  nimble::index::test::ClusterIndexGroupTestHelper helper(
+      stripeId.clusterIndex().get());
   EXPECT_EQ(helper.groupIndex(), 0);
   EXPECT_EQ(helper.firstStripe(), 0);
   EXPECT_EQ(helper.stripeCount(), 1);
-  EXPECT_EQ(helper.streamCount(), 4);
+
+  nimble::index::test::ChunkIndexTestHelper chunkHelper(
+      stripeId.chunkIndex().get());
+  EXPECT_EQ(chunkHelper.streamCount(), 4);
 
   // Verify key stream stats
   {
@@ -3410,7 +3583,7 @@ TEST_F(TabletWithIndexTest, streamDeduplication) {
 
   // Stream 0: 2 chunks (rows: 40, 60)
   {
-    auto stream0Stats = helper.streamStats(0);
+    auto stream0Stats = chunkHelper.streamStats(0);
     EXPECT_EQ(stream0Stats.chunkCounts, (std::vector<uint32_t>{2}));
     EXPECT_EQ(stream0Stats.chunkRows, (std::vector<uint32_t>{40, 100}));
   }
@@ -3418,14 +3591,14 @@ TEST_F(TabletWithIndexTest, streamDeduplication) {
   // Stream 1: 2 chunks (rows: 50, 50) - duplicate content of stream 0
   // Verify duplicate stream has same number of chunks as source stream (0)
   {
-    auto stream1Stats = helper.streamStats(1);
+    auto stream1Stats = chunkHelper.streamStats(1);
     EXPECT_EQ(stream1Stats.chunkCounts, (std::vector<uint32_t>{2}));
     EXPECT_EQ(stream1Stats.chunkRows, (std::vector<uint32_t>{40, 100}));
   }
 
   // Stream 2: 3 chunks (rows: 30, 40, 30)
   {
-    auto stream2Stats = helper.streamStats(2);
+    auto stream2Stats = chunkHelper.streamStats(2);
     EXPECT_EQ(stream2Stats.chunkCounts, (std::vector<uint32_t>{3}));
     EXPECT_EQ(stream2Stats.chunkRows, (std::vector<uint32_t>{30, 70, 100}));
   }
@@ -3433,7 +3606,7 @@ TEST_F(TabletWithIndexTest, streamDeduplication) {
   // Stream 3: 3 chunks (rows: 35, 35, 30) - duplicate content of stream 2
   // Verify duplicate stream has same number of chunks as source stream (2)
   {
-    auto stream3Stats = helper.streamStats(3);
+    auto stream3Stats = chunkHelper.streamStats(3);
     EXPECT_EQ(stream3Stats.chunkCounts, (std::vector<uint32_t>{3}));
     EXPECT_EQ(stream3Stats.chunkRows, (std::vector<uint32_t>{30, 70, 100}));
   }
@@ -3464,100 +3637,81 @@ TEST_F(TabletWithIndexTest, streamDeduplication) {
   }
 }
 
-TEST_F(TabletWithIndexTest, keyOrderEnforcement) {
+TEST_P(TabletWithIndexTest, keyOrderEnforcement) {
   // Test key order enforcement behavior with enforceKeyOrder = true/false
-  // Test both out-of-order keys and duplicate keys scenarios
-  enum class TestCase { kOutOfOrder, kDuplicateKeys };
-
   for (bool enforceKeyOrder : {true, false}) {
-    for (auto testCase : {TestCase::kOutOfOrder, TestCase::kDuplicateKeys}) {
-      SCOPED_TRACE(
-          fmt::format(
-              "enforceKeyOrder={}, testCase={}",
-              enforceKeyOrder,
-              testCase == TestCase::kOutOfOrder ? "OutOfOrder"
-                                                : "DuplicateKeys"));
+    SCOPED_TRACE(fmt::format("enforceKeyOrder={}", enforceKeyOrder));
 
-      std::string file;
-      velox::InMemoryWriteFile writeFile(&file);
+    std::string file;
+    velox::InMemoryWriteFile writeFile(&file);
 
-      nimble::TabletIndexConfig indexConfig{
-          .columns = {"col1"},
-          .sortOrders = {SortOrder{.ascending = true}},
-          .enforceKeyOrder = enforceKeyOrder,
-      };
+    nimble::ClusterIndexConfig indexConfig{
+        .columns = {"col1"},
+        .sortOrders = {SortOrder{.ascending = true}},
+        .enforceKeyOrder = enforceKeyOrder,
+        .noDuplicateKey = enforceKeyOrder,
+    };
 
-      auto tabletWriter = nimble::TabletWriter::create(
-          &writeFile,
-          *pool_,
-          {
-              .indexConfig = indexConfig,
-          });
+    auto tabletWriter = nimble::TabletWriter::create(
+        &writeFile,
+        *pool_,
+        {
+            .indexConfig = indexConfig,
+        });
 
-      nimble::Buffer buffer{*pool_};
+    nimble::Buffer buffer{*pool_};
 
-      // Write first stripe with key ending at "ddd"
-      {
-        std::vector<nimble::Stream> streams;
-        auto pos = buffer.reserve(10);
-        std::memset(pos, 'A', 10);
-        streams.push_back(
-            {.offset = 0,
-             .chunks = {{.rowCount = 100, .content = {{pos, 10}}}}});
+    // Write first stripe with key ending at "ddd"
+    {
+      std::vector<nimble::Stream> streams;
+      auto pos = buffer.reserve(10);
+      std::memset(pos, 'A', 10);
+      streams.push_back(
+          {.offset = 0, .chunks = {{.rowCount = 100, .content = {{pos, 10}}}}});
 
-        auto keyStream = createKeyStream(
-            buffer, {{.rowCount = 100, .firstKey = "ccc", .lastKey = "ddd"}});
-        tabletWriter->writeStripe(
-            100, std::move(streams), std::move(keyStream));
-      }
+      auto keyStream = createKeyStream(
+          buffer, {{.rowCount = 100, .firstKey = "ccc", .lastKey = "ddd"}});
+      tabletWriter->writeStripe(100, std::move(streams), std::move(keyStream));
+    }
 
-      // Write second stripe with invalid key ordering
-      {
-        std::vector<nimble::Stream> streams;
-        auto pos = buffer.reserve(10);
-        std::memset(pos, 'B', 10);
-        streams.push_back(
-            {.offset = 0,
-             .chunks = {{.rowCount = 100, .content = {{pos, 10}}}}});
+    // Write second stripe with key ending before "ddd" (out of order)
+    {
+      std::vector<nimble::Stream> streams;
+      auto pos = buffer.reserve(10);
+      std::memset(pos, 'B', 10);
+      streams.push_back(
+          {.offset = 0, .chunks = {{.rowCount = 100, .content = {{pos, 10}}}}});
 
-        // Create key stream based on test case:
-        // - OutOfOrder: Key "bbb" < previous "ddd"
-        // - DuplicateKeys: Key "ddd" == previous "ddd"
-        auto keyStream = testCase == TestCase::kOutOfOrder
-            ? createKeyStream(
-                  buffer,
-                  {{.rowCount = 100, .firstKey = "aaa", .lastKey = "bbb"}})
-            : createKeyStream(
-                  buffer,
-                  {{.rowCount = 100, .firstKey = "ddd", .lastKey = "ddd"}});
+      // Key "bbb" < "ddd", out of order
+      auto keyStream = createKeyStream(
+          buffer, {{.rowCount = 100, .firstKey = "aaa", .lastKey = "bbb"}});
 
-        if (enforceKeyOrder) {
-          // Should throw when enforceKeyOrder is true
-          NIMBLE_ASSERT_USER_THROW(
-              tabletWriter->writeStripe(
-                  100, std::move(streams), std::move(keyStream)),
-              "Stripe keys must be in strictly ascending order (duplicates are not allowed)");
-        } else {
-          // Should NOT throw when enforceKeyOrder is false
-          EXPECT_NO_THROW(tabletWriter->writeStripe(
-              100, std::move(streams), std::move(keyStream)));
+      if (enforceKeyOrder) {
+        // Should throw when enforceKeyOrder is true
+        NIMBLE_ASSERT_USER_THROW(
+            tabletWriter->writeStripe(
+                100, std::move(streams), std::move(keyStream)),
+            "Stripe keys must be in strictly ascending order");
+      } else {
+        // Should NOT throw when enforceKeyOrder is false
+        EXPECT_NO_THROW(tabletWriter->writeStripe(
+            100, std::move(streams), std::move(keyStream)));
 
-          tabletWriter->close();
-          writeFile.close();
+        tabletWriter->close();
+        writeFile.close();
 
-          // Verify file is readable
-          nimble::testing::InMemoryTrackableReadFile readFile(file, false);
-          auto tablet = nimble::TabletReader::create(&readFile, *pool_);
-          EXPECT_EQ(tablet->stripeCount(), 2);
-          EXPECT_TRUE(
-              tablet->hasOptionalSection(std::string(nimble::kIndexSection)));
-        }
+        // Verify file is readable
+        nimble::testing::InMemoryTrackableReadFile readFile(file, false);
+        auto tablet = nimble::TabletReader::create(&readFile, pool_.get(), {});
+        EXPECT_EQ(tablet->stripeCount(), 2);
+        EXPECT_TRUE(tablet->hasOptionalSection(
+            std::string(nimble::kClusterIndexSection)));
       }
     }
   }
 }
 
-TEST_F(TabletWithIndexTest, noIndex) {
+TEST_P(TabletWithIndexTest, noIndex) {
   // Test that without index config, no index section is written
   std::string file;
   velox::InMemoryWriteFile writeFile(&file);
@@ -3581,10 +3735,819 @@ TEST_F(TabletWithIndexTest, noIndex) {
   tabletWriter->close();
   writeFile.close();
 
-  // Verify no index section
+  // Verify no index section and no chunk index section
   nimble::testing::InMemoryTrackableReadFile readFile(file, false);
-  auto tablet = nimble::TabletReader::create(&readFile, *pool_);
+  auto tablet = nimble::TabletReader::create(&readFile, pool_.get(), {});
   EXPECT_EQ(tablet->stripeCount(), 1);
-  EXPECT_FALSE(tablet->hasOptionalSection(std::string(nimble::kIndexSection)));
+  EXPECT_FALSE(
+      tablet->hasOptionalSection(std::string(nimble::kClusterIndexSection)));
+  EXPECT_FALSE(
+      tablet->hasOptionalSection(std::string(nimble::kChunkIndexSection)));
 }
+
+// Tests all four orthogonal config combinations of enableChunkIndex ×
+// indexConfig to verify:
+// 1. Neither: no optional sections
+// 2. Chunk index only: chunk_index section exists, lookupChunk works
+// 3. Cluster index only (indexConfig): both sections exist (chunk index is
+//    auto-enabled), key lookup and chunk lookup work
+// 4. Both explicitly: same as #3
+TEST_F(TabletWithIndexTest, configCombinations) {
+  struct TestConfig {
+    bool enableChunkIndex;
+    bool enableIndexConfig;
+    bool expectChunkIndex;
+    bool expectClusterIndex;
+
+    std::string debugString() const {
+      return fmt::format(
+          "enableChunkIndex={}, enableIndexConfig={}, expectChunkIndex={}, expectClusterIndex={}",
+          enableChunkIndex,
+          enableIndexConfig,
+          expectChunkIndex,
+          expectClusterIndex);
+    }
+  };
+
+  std::vector<TestConfig> configs = {
+      // 1. Neither: no optional sections
+      {false, false, false, false},
+      // 2. Chunk index only
+      {true, false, true, false},
+      // 3. Cluster index only: chunk index auto-enabled
+      {false, true, true, true},
+      // 4. Both explicitly
+      {true, true, true, true},
+  };
+
+  for (const auto& config : configs) {
+    SCOPED_TRACE(config.debugString());
+
+    std::string file;
+    velox::InMemoryWriteFile writeFile(&file);
+
+    std::optional<nimble::ClusterIndexConfig> indexConfig;
+    if (config.enableIndexConfig) {
+      indexConfig = nimble::ClusterIndexConfig{
+          .columns = {"col1"},
+          .sortOrders = {SortOrder{.ascending = true}},
+          .enforceKeyOrder = true,
+      };
+    }
+
+    auto tabletWriter = nimble::TabletWriter::create(
+        &writeFile,
+        *pool_,
+        {
+            .metadataFlushThreshold = 1024 * 1024 * 1024,
+            .enableChunkIndex = config.enableChunkIndex,
+            .indexConfig = indexConfig,
+        });
+
+    nimble::Buffer buffer{*pool_};
+
+    // Write 2 stripes with 2 streams each
+    for (int stripe = 0; stripe < 2; ++stripe) {
+      auto streams = createStreams(
+          buffer,
+          {
+              {.offset = 0,
+               .chunks =
+                   {
+                       {.rowCount = 30, .size = 10},
+                       {.rowCount = 20, .size = 8},
+                   }},
+              {.offset = 1,
+               .chunks =
+                   {
+                       {.rowCount = 50, .size = 15},
+                   }},
+          });
+
+      std::optional<nimble::KeyStream> keyStream;
+      if (config.enableIndexConfig) {
+        std::string firstKey = stripe == 0 ? "aaa" : "ccc";
+        std::string lastKey = stripe == 0 ? "bbb" : "ddd";
+        keyStream = createKeyStream(
+            buffer,
+            {
+                {.rowCount = 50, .firstKey = firstKey, .lastKey = lastKey},
+            });
+      }
+
+      tabletWriter->writeStripe(50, std::move(streams), std::move(keyStream));
+    }
+
+    tabletWriter->close();
+    writeFile.close();
+
+    // Read back
+    nimble::testing::InMemoryTrackableReadFile readFile(file, false);
+    auto tablet = nimble::TabletReader::create(&readFile, pool_.get(), {});
+    EXPECT_EQ(tablet->stripeCount(), 2);
+
+    // Verify optional sections
+    EXPECT_EQ(
+        tablet->hasOptionalSection(std::string(nimble::kChunkIndexSection)),
+        config.expectChunkIndex);
+    EXPECT_EQ(
+        tablet->hasOptionalSection(std::string(nimble::kClusterIndexSection)),
+        config.expectClusterIndex);
+
+    // Verify chunk index functionality
+    if (config.expectChunkIndex) {
+      auto stripeId = tablet->stripeIdentifier(0);
+      ASSERT_NE(stripeId.chunkIndex(), nullptr);
+
+      nimble::index::test::ChunkIndexTestHelper chunkHelper(
+          stripeId.chunkIndex().get());
+      EXPECT_EQ(chunkHelper.streamCount(), 2);
+
+      auto stream0Stats = chunkHelper.streamStats(0);
+      // 2 stripes in 1 group, stream 0: 2 chunks each (rows: 30, 20)
+      EXPECT_EQ(stream0Stats.chunkCounts, (std::vector<uint32_t>{2, 4}));
+      EXPECT_EQ(
+          stream0Stats.chunkRows, (std::vector<uint32_t>{30, 50, 30, 50}));
+    }
+
+    // Verify cluster index functionality
+    if (config.expectClusterIndex) {
+      EXPECT_TRUE(tablet->hasClusterIndex());
+      const auto* idx = tablet->clusterIndex();
+      ASSERT_NE(idx, nullptr);
+      EXPECT_EQ(idx->numStripes(), 2);
+      EXPECT_EQ(idx->minKey(), "aaa");
+      EXPECT_EQ(idx->maxKey(), "ddd");
+
+      // Key lookup
+      EXPECT_EQ(idx->lookup("aaa")->stripeIndex, 0);
+      EXPECT_EQ(idx->lookup("bbb")->stripeIndex, 0);
+      EXPECT_EQ(idx->lookup("ccc")->stripeIndex, 1);
+      EXPECT_EQ(idx->lookup("ddd")->stripeIndex, 1);
+      EXPECT_FALSE(idx->lookup("eee").has_value());
+    }
+
+    // When chunk index is not enabled, chunkIndex should be null
+    if (!config.expectChunkIndex) {
+      auto stripeId = tablet->stripeIdentifier(0);
+      EXPECT_EQ(stripeId.chunkIndex(), nullptr);
+    }
+  }
+}
+
+TEST_P(TabletWithIndexTest, emptyFileWithIndexConfig) {
+  // Test writing an empty file (no stripes) with index config.
+  // The root index should contain only config (columns, sort orders)
+  // but no stripe keys or stripe index groups.
+  std::string file;
+  velox::InMemoryWriteFile writeFile(&file);
+
+  const nimble::ClusterIndexConfig indexConfig{
+      .columns = {"col1", "col2", "col3"},
+      .sortOrders =
+          {SortOrder{.ascending = true},
+           SortOrder{.ascending = false},
+           SortOrder{.ascending = true}},
+      .enforceKeyOrder = true,
+      .noDuplicateKey = false,
+  };
+
+  auto tabletWriter = nimble::TabletWriter::create(
+      &writeFile,
+      *pool_,
+      {
+          .indexConfig = indexConfig,
+      });
+
+  // Close without writing any stripes.
+  tabletWriter->close();
+  writeFile.close();
+
+  // Verify the file can be read.
+  nimble::testing::InMemoryTrackableReadFile readFile(file, false);
+  auto tablet = nimble::TabletReader::create(&readFile, pool_.get(), {});
+
+  // Verify no stripes.
+  EXPECT_EQ(tablet->stripeCount(), 0);
+
+  // Verify index section exists (with config only).
+  EXPECT_TRUE(
+      tablet->hasOptionalSection(std::string(nimble::kClusterIndexSection)));
+
+  // Verify root index has config but no stripe data.
+  auto* clusterIndex = tablet->clusterIndex();
+  ASSERT_NE(clusterIndex, nullptr);
+
+  // Verify index columns match config.
+  const auto& indexColumns = clusterIndex->indexColumns();
+  ASSERT_EQ(indexColumns.size(), 3);
+  EXPECT_EQ(indexColumns[0], "col1");
+  EXPECT_EQ(indexColumns[1], "col2");
+  EXPECT_EQ(indexColumns[2], "col3");
+
+  // Verify sort orders match config.
+  const auto& sortOrders = clusterIndex->sortOrders();
+  ASSERT_EQ(sortOrders.size(), 3);
+  EXPECT_TRUE(sortOrders[0].ascending);
+  EXPECT_FALSE(sortOrders[1].ascending);
+  EXPECT_TRUE(sortOrders[2].ascending);
+
+  // Verify no stripes in index.
+  EXPECT_EQ(clusterIndex->numStripes(), 0);
+  EXPECT_TRUE(clusterIndex->empty());
+
+  // Verify no index groups.
+  EXPECT_EQ(clusterIndex->numIndexGroups(), 0);
+
+  // Verify lookup returns no match for any key.
+  EXPECT_FALSE(clusterIndex->lookup("any_key").has_value());
+  EXPECT_FALSE(clusterIndex->lookup("").has_value());
+  EXPECT_FALSE(clusterIndex->lookup("zzz").has_value());
+}
+
+TEST_P(TabletWithIndexTest, fileLayoutWithIndex) {
+  // Test FileLayout::create() with non-empty file that has index enabled.
+  std::string file;
+  velox::InMemoryWriteFile writeFile(&file);
+  nimble::Buffer buffer(*pool_);
+
+  nimble::ClusterIndexConfig indexConfig{
+      .columns = {"col1"},
+      .sortOrders = {SortOrder{.ascending = true}},
+  };
+
+  auto tabletWriter = nimble::TabletWriter::create(
+      &writeFile,
+      *pool_,
+      {
+          .metadataFlushThreshold = 1024 * 1024 * 1024,
+          .streamDeduplicationEnabled = false,
+          .indexConfig = indexConfig,
+      });
+
+  // Write two stripes with index
+  for (int stripe = 0; stripe < 2; ++stripe) {
+    auto streams = createStreams(
+        buffer, {{.offset = 0, .chunks = {{.rowCount = 100, .size = 50}}}});
+    auto keyStream = createKeyStream(
+        buffer,
+        {{.rowCount = 100,
+          .firstKey = std::to_string(stripe * 100),
+          .lastKey = std::to_string(stripe * 100 + 99)}});
+    tabletWriter->writeStripe(100, std::move(streams), std::move(keyStream));
+  }
+  tabletWriter->close();
+  writeFile.close();
+
+  velox::InMemoryReadFile readFile(file);
+  auto layout = nimble::FileLayout::create(&readFile, pool_.get());
+
+  EXPECT_EQ(layout.fileSize, file.size());
+  EXPECT_EQ(layout.stripesInfo.size(), 2);
+  EXPECT_EQ(layout.stripeGroups.size(), 1);
+  // With index and stripes, should have index groups
+  EXPECT_EQ(layout.indexGroups.size(), 1);
+  EXPECT_GT(layout.indexGroups[0].size(), 0);
+  // Per-stripe info
+  EXPECT_EQ(layout.stripesInfo.size(), 2);
+  for (size_t i = 0; i < layout.stripesInfo.size(); ++i) {
+    EXPECT_EQ(layout.stripesInfo[i].stripeGroupIndex, 0);
+    EXPECT_GT(layout.stripesInfo[i].size, 0);
+  }
+}
+
+TEST_P(TabletWithIndexTest, cacheWarmPath) {
+  // Test that a second TabletReader on an indexed file initializes from
+  // AsyncDataCache with zero file IO, and that index data is also served
+  // from cache on the warm path.
+  if (GetParam() != BufferedInputMode::kCachedBufferedInput) {
+    GTEST_SKIP() << "Cache warm path only applies to CachedBufferedInput";
+  }
+
+  // Write a file with multiple stripes and index.
+  std::string file;
+  velox::InMemoryWriteFile writeFile(&file);
+  nimble::Buffer buffer(*pool_);
+
+  nimble::ClusterIndexConfig indexConfig{
+      .columns = {"col1"},
+      .sortOrders = {SortOrder{.ascending = true}},
+      .enforceKeyOrder = true,
+  };
+
+  auto tabletWriter = nimble::TabletWriter::create(
+      &writeFile,
+      *pool_,
+      {
+          .metadataFlushThreshold = 1024 * 1024 * 1024,
+          .streamDeduplicationEnabled = false,
+          .indexConfig = indexConfig,
+      });
+
+  constexpr int kNumStripes = 3;
+  std::vector<std::string> firstKeys = {"aaa", "ccc", "eee"};
+  std::vector<std::string> lastKeys = {"bbb", "ddd", "fff"};
+  for (int i = 0; i < kNumStripes; ++i) {
+    auto streams = createStreams(
+        buffer, {{.offset = 0, .chunks = {{.rowCount = 100, .size = 50}}}});
+    auto keyStream = createKeyStream(
+        buffer,
+        {{.rowCount = 100, .firstKey = firstKeys[i], .lastKey = lastKeys[i]}});
+    tabletWriter->writeStripe(100, std::move(streams), std::move(keyStream));
+  }
+  tabletWriter->close();
+  writeFile.close();
+
+  auto readFile = std::make_shared<velox::InMemoryReadFile>(file);
+
+  // Initialize cache before the cold reader so we can verify it starts empty.
+  allocator_ = std::make_shared<velox::memory::MallocAllocator>(
+      velox::memory::MemoryAllocator::Options{
+          .capacity = 1UL << 30, .reservationByteLimit = 0});
+  cache_ = velox::cache::AsyncDataCache::create(allocator_.get());
+
+  auto coldCacheStats = cache_->refreshStats();
+  EXPECT_EQ(coldCacheStats.numEntries, 0);
+
+  // Cold path: first reader populates the cache.
+  {
+    auto coldReader = createTabletReader(readFile);
+    EXPECT_EQ(coldReader->stripeCount(), kNumStripes);
+    EXPECT_EQ(coldReader->tabletRowCount(), kNumStripes * 100);
+    EXPECT_TRUE(coldReader->hasClusterIndex());
+    EXPECT_NE(coldReader->clusterIndex(), nullptr);
+
+    // Cold init bypasses CachedBufferedInput — no IoStatistics tracking.
+    EXPECT_EQ(ioStatistics_->ramHit().count(), 0);
+    EXPECT_EQ(ioStatistics_->ssdRead().count(), 0);
+    EXPECT_EQ(ioStatistics_->read().count(), 0);
+    EXPECT_EQ(ioStatistics_->prefetch().count(), 0);
+
+    // Verify stripe groups and index groups are accessible.
+    for (uint32_t i = 0; i < kNumStripes; ++i) {
+      auto stripeId = coldReader->stripeIdentifier(i);
+      EXPECT_NE(stripeId.stripeGroup(), nullptr);
+      EXPECT_NE(stripeId.clusterIndex(), nullptr);
+    }
+
+    // Verify index lookup works.
+    auto location = coldReader->clusterIndex()->lookup("bbb");
+    ASSERT_TRUE(location.has_value());
+    EXPECT_EQ(location->stripeIndex, 0);
+  }
+
+  coldCacheStats = cache_->refreshStats();
+  EXPECT_GT(coldCacheStats.numEntries, 0);
+  EXPECT_GT(coldCacheStats.numNew, 0);
+  EXPECT_EQ(coldCacheStats.numEvict, 0);
+
+  // Reset IO stats for the warm path.
+  ioStatistics_ = std::make_shared<velox::dwio::common::IoStatistics>();
+
+  // Warm path: second reader should initialize from cache with zero IO.
+  {
+    auto warmReader = createTabletReader(readFile);
+    EXPECT_EQ(warmReader->stripeCount(), kNumStripes);
+    EXPECT_EQ(warmReader->tabletRowCount(), kNumStripes * 100);
+    EXPECT_TRUE(warmReader->hasClusterIndex());
+    EXPECT_NE(warmReader->clusterIndex(), nullptr);
+
+    // Warm path should serve all data from RAM cache.
+    EXPECT_GT(ioStatistics_->ramHit().count(), 0);
+    EXPECT_EQ(ioStatistics_->ssdRead().count(), 0);
+    EXPECT_EQ(ioStatistics_->read().count(), 0);
+    EXPECT_EQ(ioStatistics_->prefetch().count(), 0);
+
+    // Verify stripe groups and index groups are accessible from cache.
+    for (uint32_t i = 0; i < kNumStripes; ++i) {
+      auto stripeId = warmReader->stripeIdentifier(i);
+      EXPECT_NE(stripeId.stripeGroup(), nullptr);
+      EXPECT_NE(stripeId.clusterIndex(), nullptr);
+    }
+
+    // Verify index lookup still works from cache.
+    auto location = warmReader->clusterIndex()->lookup("ddd");
+    ASSERT_TRUE(location.has_value());
+    EXPECT_EQ(location->stripeIndex, 1);
+  }
+
+  // Warm reader should have additional cache hits, no new entries or evictions.
+  auto warmCacheStats = cache_->refreshStats();
+  EXPECT_EQ(warmCacheStats.numEntries, coldCacheStats.numEntries);
+  EXPECT_GT(warmCacheStats.numHit, coldCacheStats.numHit);
+  EXPECT_EQ(warmCacheStats.numNew, coldCacheStats.numNew);
+  EXPECT_EQ(warmCacheStats.numEvict, 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    BufferedInputModes,
+    TabletWithIndexTest,
+    ::testing::Values(
+        BufferedInputMode::kNone,
+        BufferedInputMode::kBufferedInput,
+        BufferedInputMode::kDirectBufferedInput,
+        BufferedInputMode::kCachedBufferedInput),
+    [](const ::testing::TestParamInfo<BufferedInputMode>& info) {
+      return bufferedInputModeToString(info.param);
+    });
+
+TEST_P(TabletTest, writeAfterCloseThrows) {
+  // Test that write operations throw after close().
+  std::string file;
+  velox::InMemoryWriteFile writeFile(&file);
+  nimble::Buffer buffer(*pool_);
+
+  auto tabletWriter = nimble::TabletWriter::create(&writeFile, *pool_, {});
+  tabletWriter->close();
+  writeFile.close();
+
+  // Prepare a stream for writeStripe
+  const auto size = 100;
+  auto pos = buffer.reserve(size);
+  std::memset(pos, 'x', size);
+  std::vector<nimble::Stream> streams;
+  streams.push_back({
+      .offset = 0,
+      .chunks = {{.content = {std::string_view(pos, size)}}},
+  });
+
+  // writeStripe should throw after close
+  NIMBLE_ASSERT_USER_THROW(
+      tabletWriter->writeStripe(100, std::move(streams)),
+      "TabletWriter is already closed");
+
+  // writeOptionalSection should throw after close
+  NIMBLE_ASSERT_USER_THROW(
+      tabletWriter->writeOptionalSection("test", "content"),
+      "TabletWriter is already closed");
+
+  // close should throw when called twice
+  NIMBLE_ASSERT_USER_THROW(
+      tabletWriter->close(), "TabletWriter is already closed");
+}
+
+TEST_P(TabletTest, readerOptionsAdaptiveMode) {
+  // Test adaptive mode (maxFooterIoBytes=0) which reads postscript first,
+  // then exact footer size.
+  std::string file;
+  velox::InMemoryWriteFile writeFile(&file);
+  nimble::Buffer buffer(*pool_);
+
+  auto tabletWriter = nimble::TabletWriter::create(&writeFile, *pool_, {});
+
+  std::vector<nimble::Stream> streams;
+  const auto size = 100;
+  auto pos = buffer.reserve(size);
+  std::memset(pos, 'x', size);
+  streams.push_back({
+      .offset = 0,
+      .chunks = {{.content = {std::string_view(pos, size)}}},
+  });
+  tabletWriter->writeStripe(500, std::move(streams));
+  tabletWriter->close();
+  writeFile.close();
+
+  // Read with adaptive mode (maxFooterIoBytes=0)
+  nimble::testing::InMemoryTrackableReadFile readFile(file, false);
+  nimble::TabletReader::Options options;
+  options.maxFooterIoBytes = 0; // Adaptive mode
+  auto tablet = nimble::TabletReader::create(&readFile, pool_.get(), options);
+
+  EXPECT_EQ(tablet->stripeCount(), 1);
+  EXPECT_EQ(tablet->stripeRowCount(0), 500);
+}
+
+TEST_P(TabletTest, readerOptionsSpeculativeMode) {
+  // Test speculative mode (non-zero maxFooterIoBytes).
+  std::string file;
+  velox::InMemoryWriteFile writeFile(&file);
+  nimble::Buffer buffer(*pool_);
+
+  auto tabletWriter = nimble::TabletWriter::create(&writeFile, *pool_, {});
+
+  std::vector<nimble::Stream> streams;
+  const auto size = 100;
+  auto pos = buffer.reserve(size);
+  std::memset(pos, 'y', size);
+  streams.push_back({
+      .offset = 0,
+      .chunks = {{.content = {std::string_view(pos, size)}}},
+  });
+  tabletWriter->writeStripe(600, std::move(streams));
+  tabletWriter->close();
+  writeFile.close();
+
+  // Read with speculative mode
+  nimble::testing::InMemoryTrackableReadFile readFile(file, false);
+  nimble::TabletReader::Options options;
+  options.maxFooterIoBytes = 1024; // Small speculative read
+  auto tablet = nimble::TabletReader::create(&readFile, pool_.get(), options);
+
+  EXPECT_EQ(tablet->stripeCount(), 1);
+  EXPECT_EQ(tablet->stripeRowCount(0), 600);
+}
+
+TEST_P(TabletTest, bufferedInputMetadataReads) {
+  // Test that BufferedInput is used for metadata reads when provided.
+  std::string file;
+  velox::InMemoryWriteFile writeFile(&file);
+  nimble::Buffer buffer(*pool_);
+
+  auto tabletWriter = nimble::TabletWriter::create(&writeFile, *pool_, {});
+
+  // Write multiple stripes to ensure we have stripe group metadata to read.
+  for (int i = 0; i < 3; ++i) {
+    std::vector<nimble::Stream> streams;
+    const auto size = 100;
+    auto pos = buffer.reserve(size);
+    std::memset(pos, 'a' + i, size);
+    streams.push_back({
+        .offset = 0,
+        .chunks = {{.rowCount = 100, .content = {std::string_view(pos, size)}}},
+    });
+    tabletWriter->writeStripe(100, std::move(streams));
+  }
+  tabletWriter->close();
+  writeFile.close();
+
+  auto tablet = createTabletReader(file);
+
+  nimble::test::TabletReaderTestHelper tabletHelper(tablet.get());
+  EXPECT_EQ(tabletHelper.hasCache(), expectHasCache());
+  EXPECT_EQ(tablet->stripeCount(), 3);
+
+  // Verify we can read stripe data.
+  auto stripeId = tablet->stripeIdentifier(0);
+  EXPECT_EQ(stripeId.stripeId(), 0);
+  EXPECT_NE(stripeId.stripeGroup(), nullptr);
+}
+
+TEST_P(TabletTest, cacheWarmPath) {
+  // Test that a second TabletReader on the same file initializes from
+  // AsyncDataCache with zero file IO when file-metadata-cache is enabled.
+  // Only meaningful for CachedBufferedInput mode.
+  if (GetParam() != BufferedInputMode::kCachedBufferedInput) {
+    GTEST_SKIP() << "Cache warm path only applies to CachedBufferedInput";
+  }
+
+  // Write a file with multiple stripes.
+  std::string file;
+  velox::InMemoryWriteFile writeFile(&file);
+  nimble::Buffer buffer(*pool_);
+
+  auto tabletWriter = nimble::TabletWriter::create(&writeFile, *pool_, {});
+  constexpr int kNumStripes = 3;
+  for (int i = 0; i < kNumStripes; ++i) {
+    std::vector<nimble::Stream> streams;
+    const auto size = 100;
+    auto pos = buffer.reserve(size);
+    std::memset(pos, 'a' + i, size);
+    streams.push_back({
+        .offset = 0,
+        .chunks = {{.rowCount = 100, .content = {std::string_view(pos, size)}}},
+    });
+    tabletWriter->writeStripe(100, std::move(streams));
+  }
+  tabletWriter->close();
+  writeFile.close();
+
+  auto readFile = std::make_shared<velox::InMemoryReadFile>(file);
+
+  // Initialize cache before the cold reader so we can verify it starts empty.
+  // Normally lazy-initialized in createBufferedInput.
+  allocator_ = std::make_shared<velox::memory::MallocAllocator>(
+      velox::memory::MemoryAllocator::Options{
+          .capacity = 1UL << 30, .reservationByteLimit = 0});
+  cache_ = velox::cache::AsyncDataCache::create(allocator_.get());
+
+  // Cache should be empty before the cold reader.
+  auto coldCacheStats = cache_->refreshStats();
+  EXPECT_EQ(coldCacheStats.numEntries, 0);
+  EXPECT_EQ(coldCacheStats.numHit, 0);
+  EXPECT_EQ(coldCacheStats.numNew, 0);
+
+  // Cold path: first reader populates the cache.
+  {
+    auto coldReader = createTabletReader(readFile);
+    EXPECT_EQ(coldReader->stripeCount(), kNumStripes);
+    EXPECT_EQ(coldReader->tabletRowCount(), kNumStripes * 100);
+
+    // Cold init uses direct file_->preadv() which bypasses
+    // CachedBufferedInput, so no reads are tracked through IoStatistics.
+    EXPECT_EQ(ioStatistics_->ramHit().count(), 0);
+    EXPECT_EQ(ioStatistics_->ssdRead().count(), 0);
+    EXPECT_EQ(ioStatistics_->read().count(), 0);
+    EXPECT_EQ(ioStatistics_->prefetch().count(), 0);
+
+    auto stripeId = coldReader->stripeIdentifier(0);
+    EXPECT_EQ(stripeId.stripeId(), 0);
+    EXPECT_NE(stripeId.stripeGroup(), nullptr);
+  }
+
+  // Cold reader should have populated the cache with metadata entries.
+  // numHit may be > 0 from self-hits within the cold reader (coalesced IO can
+  // populate a cache entry that is then hit by a subsequent read).
+  coldCacheStats = cache_->refreshStats();
+  EXPECT_GT(coldCacheStats.numEntries, 0);
+  EXPECT_GT(coldCacheStats.numNew, 0);
+  EXPECT_EQ(coldCacheStats.numEvict, 0);
+
+  // Reset IO stats for the warm path.
+  ioStatistics_ = std::make_shared<velox::dwio::common::IoStatistics>();
+
+  // Warm path: second reader should initialize from cache with zero IO.
+  {
+    auto warmReader = createTabletReader(readFile);
+    EXPECT_EQ(warmReader->stripeCount(), kNumStripes);
+    EXPECT_EQ(warmReader->tabletRowCount(), kNumStripes * 100);
+    for (uint32_t i = 0; i < kNumStripes; ++i) {
+      EXPECT_EQ(warmReader->stripeRowCount(i), 100);
+    }
+
+    // Warm path should serve all data from RAM cache with zero storage reads.
+    EXPECT_GT(ioStatistics_->ramHit().count(), 0);
+    EXPECT_EQ(ioStatistics_->ssdRead().count(), 0);
+    EXPECT_EQ(ioStatistics_->read().count(), 0);
+    EXPECT_EQ(ioStatistics_->prefetch().count(), 0);
+
+    auto stripeId = warmReader->stripeIdentifier(0);
+    EXPECT_EQ(stripeId.stripeId(), 0);
+    EXPECT_NE(stripeId.stripeGroup(), nullptr);
+  }
+
+  // Warm reader should have additional cache hits beyond what the cold reader
+  // generated, with no new entries or evictions.
+  auto warmCacheStats = cache_->refreshStats();
+  EXPECT_EQ(warmCacheStats.numEntries, coldCacheStats.numEntries);
+  EXPECT_GT(warmCacheStats.numHit, coldCacheStats.numHit);
+  EXPECT_EQ(warmCacheStats.numNew, coldCacheStats.numNew);
+  EXPECT_EQ(warmCacheStats.numEvict, 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    BufferedInputModes,
+    TabletTest,
+    ::testing::Values(
+        BufferedInputMode::kNone,
+        BufferedInputMode::kBufferedInput,
+        BufferedInputMode::kDirectBufferedInput,
+        BufferedInputMode::kCachedBufferedInput),
+    [](const ::testing::TestParamInfo<BufferedInputMode>& info) {
+      return bufferedInputModeToString(info.param);
+    });
+
+// Stress test: concurrent readers with mixed BufferedInput modes and periodic
+// cache eviction. Exercises race conditions between cache population, cache
+// eviction, and reader initialization.
+TEST(TabletStressTest, concurrentReadersWithCacheEviction) {
+  velox::memory::MemoryManager::testingSetInstance({});
+  auto pool =
+      velox::memory::MemoryManager::getInstance()->addRootPool("stressTest");
+
+  // Write a file with multiple stripes.
+  std::string file;
+  {
+    auto writerPool = pool->addLeafChild("writer");
+    velox::InMemoryWriteFile writeFile(&file);
+    nimble::Buffer buffer(*writerPool);
+    auto tabletWriter =
+        nimble::TabletWriter::create(&writeFile, *writerPool, {});
+    constexpr int kNumStripes = 5;
+    for (int i = 0; i < kNumStripes; ++i) {
+      std::vector<nimble::Stream> streams;
+      const auto size = 200;
+      auto pos = buffer.reserve(size);
+      std::memset(pos, 'a' + i, size);
+      streams.push_back({
+          .offset = 0,
+          .chunks =
+              {{.rowCount = 200, .content = {std::string_view(pos, size)}}},
+      });
+      tabletWriter->writeStripe(200, std::move(streams));
+    }
+    tabletWriter->close();
+    writeFile.close();
+  }
+
+  auto readFile = std::make_shared<velox::InMemoryReadFile>(file);
+
+  // Shared cache infrastructure.
+  auto allocator = std::make_shared<velox::memory::MallocAllocator>(
+      velox::memory::MemoryAllocator::Options{
+          .capacity = 1UL << 30, .reservationByteLimit = 0});
+  auto cache = velox::cache::AsyncDataCache::create(allocator.get());
+  auto executor = std::make_unique<folly::CPUThreadPoolExecutor>(4);
+
+  constexpr int kNumReaderThreads = 8;
+  constexpr auto kTestDuration = std::chrono::seconds(20);
+  std::atomic_bool stop{false};
+  std::atomic_uint64_t readCount{0};
+
+  auto readerFunc = [&](int threadId) {
+    auto threadPool = pool->addLeafChild(fmt::format("reader_{}", threadId));
+    auto& ids = velox::fileIds();
+
+    while (!stop.load(std::memory_order_relaxed)) {
+      // Each thread cycles through a fixed BufferedInput mode.
+      auto mode = static_cast<BufferedInputMode>(threadId % 4);
+      std::unique_ptr<velox::dwio::common::BufferedInput> bi;
+      auto ioStats = std::make_shared<velox::dwio::common::IoStatistics>();
+      std::shared_ptr<velox::cache::ScanTracker> tracker;
+      velox::io::ReaderOptions readerOptions(threadPool.get());
+      nimble::TabletReader::Options options;
+
+      switch (mode) {
+        case BufferedInputMode::kNone:
+          break;
+
+        case BufferedInputMode::kBufferedInput:
+          bi = std::make_unique<velox::dwio::common::BufferedInput>(
+              readFile, *threadPool);
+          options.bufferedInput = bi.get();
+          break;
+
+        case BufferedInputMode::kDirectBufferedInput: {
+          tracker = std::make_shared<velox::cache::ScanTracker>(
+              "tracker", nullptr, 256 << 10);
+          velox::StringIdLease fileId(ids, fmt::format("stress_{}", threadId));
+          velox::StringIdLease groupId(ids, "stressGroup");
+          bi = std::make_unique<velox::dwio::common::DirectBufferedInput>(
+              readFile,
+              velox::dwio::common::MetricsLog::voidLog(),
+              std::move(fileId),
+              tracker,
+              std::move(groupId),
+              ioStats,
+              nullptr,
+              executor.get(),
+              readerOptions);
+          options.bufferedInput = bi.get();
+          break;
+        }
+
+        case BufferedInputMode::kCachedBufferedInput: {
+          tracker = std::make_shared<velox::cache::ScanTracker>(
+              "tracker", nullptr, 256 << 10);
+          velox::StringIdLease fileId(ids, "stressFile");
+          velox::StringIdLease groupId(ids, "stressGroup");
+          bi = std::make_unique<velox::dwio::common::CachedBufferedInput>(
+              readFile,
+              velox::dwio::common::MetricsLog::voidLog(),
+              std::move(fileId),
+              cache.get(),
+              tracker,
+              std::move(groupId),
+              ioStats,
+              nullptr,
+              executor.get(),
+              readerOptions);
+          options.bufferedInput = bi.get();
+          break;
+        }
+      }
+
+      auto reader = nimble::TabletReader::create(
+          readFile.get(), threadPool.get(), options);
+      EXPECT_EQ(reader->stripeCount(), 5);
+      EXPECT_EQ(reader->tabletRowCount(), 1000);
+
+      // Verify stripe data is accessible.
+      for (uint32_t i = 0; i < reader->stripeCount(); ++i) {
+        auto stripeId = reader->stripeIdentifier(i);
+        EXPECT_NE(stripeId.stripeGroup(), nullptr);
+      }
+      readCount.fetch_add(1, std::memory_order_relaxed);
+    }
+  };
+
+  // Start reader threads.
+  std::vector<std::thread> threads;
+  for (int i = 0; i < kNumReaderThreads; ++i) {
+    threads.emplace_back(readerFunc, i);
+  }
+
+  // Control thread: periodically evict all cache entries to force transitions
+  // between warm and cold init paths.
+  auto controlThread = std::thread([&] {
+    while (!stop.load(std::memory_order_relaxed)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      cache->shrink(1);
+    }
+  });
+
+  std::this_thread::sleep_for(kTestDuration);
+  stop.store(true, std::memory_order_relaxed);
+
+  for (auto& t : threads) {
+    t.join();
+  }
+  controlThread.join();
+
+  LOG(INFO) << "Stress test: " << readCount.load() << " successful reads in "
+            << kTestDuration.count() << "s";
+  EXPECT_GT(readCount.load(), 0);
+
+  cache->shutdown();
+}
+
 } // namespace

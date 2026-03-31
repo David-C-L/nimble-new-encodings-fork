@@ -94,10 +94,6 @@ std::string toString(DataType dataType) {
   }
 }
 
-fmt::underlying_t<DataType> format_as(DataType dataType) {
-  return fmt::underlying(dataType);
-}
-
 std::string toString(CompressionType compressionType) {
   switch (compressionType) {
     case CompressionType::Uncompressed:

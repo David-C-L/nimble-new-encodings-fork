@@ -12,7 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 add_library(nimble_velox_common SchemaUtils.cpp)
-target_link_libraries(nimble_velox_common nimble_common velox_type)
+target_link_libraries(
+  nimble_velox_common
+  nimble_common
+  velox_type
+  Folly::folly
+  fmt::fmt
+)
 
 add_library(nimble_velox_schema SchemaTypes.cpp)
 target_link_libraries(nimble_velox_schema nimble_common Folly::folly)
@@ -44,6 +50,7 @@ target_link_libraries(
 add_library(nimble_velox_field_reader FieldReader.cpp)
 target_link_libraries(
   nimble_velox_field_reader
+  nimble_encodings_legacy
   nimble_velox_schema_reader
   nimble_common
   Folly::folly
@@ -143,6 +150,7 @@ add_library(
 )
 target_link_libraries(
   nimble_velox_reader
+  nimble_velox_common
   nimble_velox_schema
   nimble_velox_schema_serialization
   nimble_velox_schema_fb
@@ -151,6 +159,7 @@ target_link_libraries(
   nimble_tablet_reader
   nimble_common
   nimble_encodings_legacy
+  velox_common_base
   Folly::folly
 )
 
@@ -191,6 +200,7 @@ target_link_libraries(
   Folly::folly
 )
 
+add_subdirectory(index)
 add_subdirectory(selective)
 add_subdirectory(stats)
 add_subdirectory(tests)

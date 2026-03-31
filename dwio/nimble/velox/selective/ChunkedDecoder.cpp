@@ -16,8 +16,7 @@
 
 #include "dwio/nimble/velox/selective/ChunkedDecoder.h"
 
-#include "dwio/nimble/common/Constants.h"
-#include "dwio/nimble/common/EncodingPrimitives.h"
+#include "dwio/nimble/common/ChunkHeader.h"
 #include "dwio/nimble/common/Types.h"
 #include "dwio/nimble/encodings/EncodingFactory.h"
 #include "velox/common/testutil/TestValue.h"
@@ -33,9 +32,7 @@ using namespace facebook::velox;
 void ChunkedDecoder::loadNextChunk() {
   auto ret = ensureInput(kChunkHeaderSize);
   NIMBLE_CHECK(ret, "Failed to read chunk header");
-  auto length = encoding::readUint32(inputData_);
-  const auto compressionType =
-      static_cast<CompressionType>(encoding::readChar(inputData_));
+  const auto [length, compressionType] = readChunkHeader(inputData_);
   inputSize_ -= kChunkHeaderSize;
   ret = ensureInput(length);
   NIMBLE_CHECK(ret);
@@ -83,7 +80,7 @@ bool ChunkedDecoder::ensureInput(int size) {
     } else {
       prepareInputBuffer(inputSize_ + len);
       // Append after the previous content.
-      memcpy(inputBuffer_->asMutable<char>() + inputSize_, buf, len);
+      memcpy(const_cast<char*>(inputData_) + inputSize_, buf, len);
     }
     inputSize_ += len;
   }
@@ -101,13 +98,20 @@ bool ChunkedDecoder::ensureInputIncremental_hack(int size, const char*& pos) {
 
 // After this function is called, we ensure these:
 // 1. `inputBuffer_' is allocated and at least `size' bytes large.
-// 2. The first `inputSize_' bytes in `inputData_' before the call are copied to
-//    the beginning of `inputBuffer_'.
-// 3. `inputData_' is pointing to `inputBuffer_'.
+// 2. The first `inputSize_' bytes in `inputData_' before the call are in
+//    `inputBuffer_' (either at their current position or compacted to the
+//    front).
+// 3. `inputData_' points into `inputBuffer_' with at least `size - inputSize_'
+//    bytes of trailing space available for appending.
 void ChunkedDecoder::prepareInputBuffer(int32_t size) {
   NIMBLE_DCHECK_LE(inputSize_, size);
   if (inputBuffer_ && size <= inputBuffer_->capacity()) {
     if (inputData_ == inputBuffer_->as<char>()) {
+      return;
+    }
+    if (fromInputBuffer() &&
+        inputData_ + size <=
+            inputBuffer_->as<char>() + inputBuffer_->capacity()) {
       return;
     }
     char* newInputData = inputBuffer_->asMutable<char>();
@@ -227,11 +231,10 @@ void ChunkedDecoder::skipWithIndex(int64_t numValues) {
 
   // Lookup the chunk containing targetRow.
   const auto location = streamIndex_->lookupChunk(targetRow);
-  NIMBLE_DCHECK(location.has_value());
 
   // Seek to the chunk and skip within it.
-  seekToChunk(location->streamOffset);
-  rowPosition_ = location->rowOffset;
+  seekToChunk(location.streamOffset);
+  rowPosition_ = location.rowOffset;
 
   const uint32_t rowsToSkipInChunk = targetRow - rowPosition_;
   NIMBLE_DCHECK_LT(rowsToSkipInChunk, remainingValues_);

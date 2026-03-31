@@ -16,7 +16,6 @@
 #pragma once
 
 #include <span>
-#include "dwio/nimble/common/Bits.h"
 #include "dwio/nimble/common/Buffer.h"
 #include "dwio/nimble/common/EncodingPrimitives.h"
 #include "dwio/nimble/common/EncodingType.h"
@@ -141,7 +140,7 @@ std::string_view ConstantEncoding<T>::encode(
   char* reserved = buffer.reserve(encodingSize);
   char* pos = reserved;
   Encoding::serializePrefix(
-      EncodingType::Constant, TypeTraits<T>::dataType, rowCount, pos);
+      EncodingType::Constant, TypeTraits<T>::dataType, rowCount, false, pos);
   encoding::write<physicalType>(values[0], pos);
   NIMBLE_DCHECK_EQ(pos - reserved, encodingSize, "Encoding size mismatch.");
   return {reserved, encodingSize};

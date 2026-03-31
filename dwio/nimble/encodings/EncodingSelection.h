@@ -79,25 +79,47 @@ struct ZstdCompressionParameters {
 /// An identifier for the meta internal compression policy.
 class MetaInternalCompressionKey {
  public:
+  MetaInternalCompressionKey() = default;
+
+  MetaInternalCompressionKey(
+      std::string ns,
+      std::string tableName,
+      std::string columnName)
+      : ns_{std::move(ns)},
+        tableName_{std::move(tableName)},
+        columnName_{std::move(columnName)} {}
+
+  const std::string& ns() const {
+    return ns_;
+  }
+
+  const std::string& tableName() const {
+    return tableName_;
+  }
+
+  const std::string& columnName() const {
+    return columnName_;
+  }
+
   std::string toString() const {
-    folly::dynamic json = folly::dynamic::object("ns", ns)(
-        "tableName", tableName)("columnName", columnName);
+    folly::dynamic json = folly::dynamic::object("ns", ns_)(
+        "tableName", tableName_)("columnName", columnName_);
     return folly::toJson(json);
   }
 
   static MetaInternalCompressionKey fromString(const std::string& str) {
     // will throw upon failure to parse or missing fields
     auto json = folly::parseJson(str);
-    return {
-        .ns = json["ns"].asString(),
-        .tableName = json["tableName"].asString(),
-        .columnName = json["columnName"].asString(),
-    };
+    return MetaInternalCompressionKey{
+        json["ns"].asString(),
+        json["tableName"].asString(),
+        json["columnName"].asString()};
   }
 
-  std::string ns;
-  std::string tableName;
-  std::string columnName;
+ private:
+  std::string ns_;
+  std::string tableName_;
+  std::string columnName_;
 };
 
 struct MetaInternalCompressionParameters {
@@ -199,7 +221,8 @@ class EncodingSelection {
   std::string_view encodeNested(
       NestedEncodingIdentifier identifier,
       std::span<const NestedT> values,
-      Buffer& buffer);
+      Buffer& buffer,
+      const Encoding::Options& options = {});
 
  private:
   EncodingSelectionResult selectionResult_;
@@ -275,7 +298,8 @@ template <typename NestedT>
 std::string_view EncodingSelection<T>::encodeNested(
     NestedEncodingIdentifier identifier,
     std::span<const NestedT> values,
-    Buffer& buffer) {
+    Buffer& buffer,
+    const Encoding::Options& options) {
   // Create the nested encoding selection policy instance, and cast it to the
   // strongly templated type.
   auto nestedPolicy = std::unique_ptr<EncodingSelectionPolicy<NestedT>>(
@@ -291,7 +315,8 @@ std::string_view EncodingSelection<T>::encodeNested(
           std::move(statistics),
           std::move(nestedPolicy)},
       values,
-      buffer);
+      buffer,
+      options);
 }
 
 } // namespace facebook::nimble

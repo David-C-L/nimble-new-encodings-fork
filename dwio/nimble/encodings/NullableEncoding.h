@@ -16,10 +16,10 @@
 #pragma once
 
 #include <span>
-#include "dwio/nimble/common/Bits.h"
 #include "dwio/nimble/common/Buffer.h"
 #include "dwio/nimble/common/EncodingPrimitives.h"
 #include "dwio/nimble/common/Types.h"
+#include "dwio/nimble/common/Varint.h"
 #include "dwio/nimble/common/Vector.h"
 #include "dwio/nimble/encodings/Encoding.h"
 #include "dwio/nimble/encodings/EncodingFactory.h"
@@ -46,7 +46,8 @@ class NullableEncoding final
   NullableEncoding(
       velox::memory::MemoryPool& memoryPool,
       std::string_view data,
-      std::function<void*(uint32_t)> stringBufferFactory);
+      std::function<void*(uint32_t)> stringBufferFactory,
+      const Encoding::Options& options = {});
 
   uint32_t nullCount() const final;
   bool isNullable() const final;
@@ -59,7 +60,7 @@ class NullableEncoding final
       uint32_t rowCount,
       void* buffer,
       std::function<void*()> nulls,
-      const bits::Bitmap* scatterBitmap = nullptr,
+      const velox::bits::Bitmap* scatterBitmap = nullptr,
       uint32_t offset = 0) final;
 
   template <typename DecoderVisitor>
@@ -69,7 +70,8 @@ class NullableEncoding final
       EncodingSelection<physicalType>& selection,
       std::span<const physicalType> values,
       std::span<const bool> nulls,
-      Buffer& buffer);
+      Buffer& buffer,
+      const Encoding::Options& options = {});
 
   std::string debugString(int offset) const final;
 
@@ -93,19 +95,21 @@ template <typename T>
 NullableEncoding<T>::NullableEncoding(
     velox::memory::MemoryPool& memoryPool,
     std::string_view data,
-    std::function<void*(uint32_t)> stringBufferFactory)
-    : TypedEncoding<T, physicalType>(memoryPool, data),
+    std::function<void*(uint32_t)> stringBufferFactory,
+    const Encoding::Options& options)
+    : TypedEncoding<T, physicalType>(memoryPool, data, options),
       indicesBuffer_(this->pool_),
       nullBuffer_(this->pool_) {
-  const char* pos = data.data() + Encoding::kPrefixSize;
+  const char* pos = data.data() + this->dataOffset();
   const uint32_t nonNullsBytes = encoding::readUint32(pos);
   nonNullValues_ = EncodingFactory::decode(
-      *this->pool_, {pos, nonNullsBytes}, stringBufferFactory);
+      *this->pool_, {pos, nonNullsBytes}, stringBufferFactory, options);
   pos += nonNullsBytes;
   nulls_ = EncodingFactory::decode(
       *this->pool_,
       {pos, static_cast<size_t>(data.end() - pos)},
-      stringBufferFactory);
+      stringBufferFactory,
+      options);
   NIMBLE_DCHECK_EQ(
       Encoding::rowCount(), nulls_->rowCount(), "Nulls count mismatch.");
 }
@@ -180,7 +184,7 @@ uint32_t NullableEncoding<T>::materializeNullable(
     uint32_t rowCount,
     void* buffer,
     std::function<void*()> nulls,
-    const bits::Bitmap* scatterBitmap,
+    const velox::bits::Bitmap* scatterBitmap,
     uint32_t offset) {
   nullBuffer_.resize(rowCount);
   nulls_->materialize(rowCount, nullBuffer_.data());
@@ -196,7 +200,7 @@ uint32_t NullableEncoding<T>::materializeNullable(
       scatterBitmap ? scatterBitmap->size() - offset : rowCount;
   if (nonNullCount != scatterSize) {
     void* nullBitmap = nulls();
-    bits::BitmapBuilder nullBits{nullBitmap, offset + scatterSize};
+    velox::bits::BitmapBuilder nullBits{nullBitmap, offset + scatterSize};
     nullBits.clear(offset, offset + scatterSize);
 
     uint32_t pos = offset + scatterSize - 1;
@@ -285,22 +289,31 @@ std::string_view NullableEncoding<T>::encodeNullable(
     EncodingSelection<physicalType>& selection,
     std::span<const physicalType> values,
     std::span<const bool> nulls,
-    Buffer& buffer) {
+    Buffer& buffer,
+    const Encoding::Options& options) {
+  const bool useVarint = options.useVarintRowCount;
   const uint32_t rowCount = nulls.size();
 
   Buffer tempBuffer{buffer.getMemoryPool()};
   std::string_view serializedValues =
       selection.template encodeNested<physicalType>(
-          EncodingIdentifiers::Nullable::Data, values, tempBuffer);
+          EncodingIdentifiers::Nullable::Data, values, tempBuffer, options);
   std::string_view serializedNulls = selection.template encodeNested<bool>(
-      EncodingIdentifiers::Nullable::Nulls, nulls, tempBuffer);
+      EncodingIdentifiers::Nullable::Nulls, nulls, tempBuffer, options);
 
-  const uint32_t encodingSize = Encoding::kPrefixSize + 4 +
-      serializedValues.size() + serializedNulls.size();
+  const uint32_t prefixSize = useVarint
+    ? Encoding::kRowCountOffset + varint::varintSize(rowCount)
+    : Encoding::kPrefixSize;
+  const uint32_t encodingSize =
+    prefixSize + 4 + serializedValues.size() + serializedNulls.size();
   char* reserved = buffer.reserve(encodingSize);
   char* pos = reserved;
   Encoding::serializePrefix(
-      EncodingType::Nullable, TypeTraits<T>::dataType, rowCount, pos);
+      EncodingType::Nullable,
+      TypeTraits<T>::dataType,
+      rowCount,
+      useVarint,
+      pos);
   encoding::writeString(serializedValues, pos);
   encoding::writeBytes(serializedNulls, pos);
   NIMBLE_DCHECK_EQ(pos - reserved, encodingSize, "Encoding size mismatch.");

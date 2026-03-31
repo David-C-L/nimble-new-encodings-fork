@@ -23,7 +23,8 @@
 #include <vector>
 
 #include "dwio/nimble/common/Exceptions.h"
-#include "dwio/nimble/index/StripeIndexGroup.h"
+#include "dwio/nimble/index/ChunkIndexGroup.h"
+#include "dwio/nimble/index/ClusterIndexGroup.h"
 #include "dwio/nimble/tablet/TabletReader.h"
 #include "dwio/nimble/tablet/TabletWriter.h"
 #include "dwio/nimble/velox/ChunkedStream.h"
@@ -65,11 +66,15 @@ std::vector<velox::RowVectorPtr> generateData(
 /// @param data Vector of RowVectorPtr to write.
 /// @param indexConfig Index configuration specifying columns, sort orders, etc.
 /// @param pool Memory pool for writing.
+/// @param flushPolicyFactory Optional factory for custom flush policy to
+/// control
+///        stripe sizes. If not provided, uses default flush policy.
 void writeFile(
     const std::string& filePath,
     const std::vector<velox::RowVectorPtr>& data,
     IndexConfig indexConfig,
-    velox::memory::MemoryPool& pool);
+    velox::memory::MemoryPool& pool,
+    std::function<std::unique_ptr<FlushPolicy>()> flushPolicyFactory = nullptr);
 
 /// Simple StreamLoader implementation for testing that holds data in memory.
 class TestStreamLoader : public StreamLoader {
@@ -106,7 +111,7 @@ class SingleChunkDecoder {
   InMemoryChunkedStream stream_;
 };
 
-/// Holds key stream statistics extracted from a StripeIndexGroup for testing.
+/// Holds key stream statistics extracted from a ClusterIndexGroup for testing.
 struct KeyStreamStats {
   /// Byte offset of key stream for each stripe.
   std::vector<uint32_t> offsets;
@@ -167,12 +172,12 @@ std::vector<Chunk> createChunks(
 /// The buffer is used to store the chunk content.
 Stream createStream(Buffer& buffer, const StreamSpec& spec);
 
-/// Test helper class for StripeIndexGroup
+/// Test helper class for ClusterIndexGroup that provides access
 /// to private members for testing purposes. This is a friend class of
-/// StripeIndexGroup.
-class StripeIndexGroupTestHelper {
+/// ClusterIndexGroup.
+class ClusterIndexGroupTestHelper {
  public:
-  explicit StripeIndexGroupTestHelper(const StripeIndexGroup* indexGroup)
+  explicit ClusterIndexGroupTestHelper(const ClusterIndexGroup* indexGroup)
       : indexGroup_(indexGroup) {}
 
   /// Returns the group index.
@@ -190,16 +195,8 @@ class StripeIndexGroupTestHelper {
     return indexGroup_->stripeCount_;
   }
 
-  /// Returns the number of streams per stripe.
-  uint32_t streamCount() const {
-    return indexGroup_->streamCount_;
-  }
-
   /// Returns the key stream statistics for testing verification.
   KeyStreamStats keyStreamStats() const;
-
-  /// Returns the stream position index statistics for the specified stream.
-  StreamStats streamStats(uint32_t streamId) const;
 
   /// Returns the length of a key chunk given its stream offset within a stripe.
   /// Uses the next chunk offset (if exists) or stream length for the last
@@ -210,7 +207,32 @@ class StripeIndexGroupTestHelper {
       uint32_t keyStreamLength) const;
 
  private:
-  const StripeIndexGroup* const indexGroup_;
+  const ClusterIndexGroup* const indexGroup_;
+};
+
+/// Test helper class for ChunkIndexGroup.
+class ChunkIndexTestHelper {
+ public:
+  explicit ChunkIndexTestHelper(const ChunkIndexGroup* chunkIndex)
+      : chunkIndex_(chunkIndex) {}
+
+  uint32_t firstStripe() const {
+    return chunkIndex_->firstStripe_;
+  }
+
+  uint32_t stripeCount() const {
+    return chunkIndex_->stripeCount_;
+  }
+
+  uint32_t streamCount() const {
+    return chunkIndex_->streamCount_;
+  }
+
+  /// Returns stream position index statistics for the specified stream.
+  StreamStats streamStats(uint32_t streamId) const;
+
+ private:
+  const ChunkIndexGroup* const chunkIndex_;
 };
 
 } // namespace facebook::nimble::index::test

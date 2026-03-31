@@ -23,7 +23,7 @@ target_link_libraries(
   Folly::folly
 )
 
-add_library(nimble_index_test_base TabletIndexTestBase.cpp)
+add_library(nimble_index_test_base ClusterIndexTestBase.cpp)
 target_link_libraries(
   nimble_index_test_base
   nimble_index
@@ -39,11 +39,12 @@ target_link_libraries(
 add_executable(
   nimble_index_tests
   IndexConstantsTest.cpp
+  IndexConfigTest.cpp
   IndexFilterTest.cpp
-  IndexReaderTest.cpp
-  StripeIndexGroupTest.cpp
-  TabletIndexTest.cpp
-  TabletIndexTestBase.cpp
+  ClusterIndexReaderTest.cpp
+  ClusterIndexGroupTest.cpp
+  ClusterIndexTest.cpp
+  ClusterIndexTestBase.cpp
 )
 
 add_test(nimble_index_tests nimble_index_tests)

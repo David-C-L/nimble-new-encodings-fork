@@ -15,11 +15,11 @@
  */
 #pragma once
 
-#include "dwio/nimble/common/Bits.h"
 #include "dwio/nimble/common/EncodingType.h"
 #include "dwio/nimble/common/Exceptions.h"
 #include "dwio/nimble/common/Types.h"
 #include "dwio/nimble/common/Vector.h"
+#include "velox/common/base/BitUtil.h"
 #include "velox/common/memory/Memory.h"
 #include "velox/dwio/common/ColumnVisitors.h"
 
@@ -97,16 +97,29 @@ struct ReadWithVisitorParams {
 
 class Encoding {
  public:
-  // The binary layout for each Encoding begins with the same prefix:
-  // 1 byte: EncodingType
-  // 1 byte: DataType
-  // 4 bytes: uint32_t num rows
+  /// Options for encoding/decoding, extracted from persisted storage version
+  /// (file footer or serializer version).
+  struct Options {
+    /// When true, rowCount in the encoding prefix is varint-encoded instead of
+    /// fixed 4-byte uint32. Determined from file format version or serializer
+    /// version.
+    bool useVarintRowCount;
+  };
+
+  /// The binary layout for each Encoding begins with the same prefix:
+  /// 1 byte: EncodingType
+  /// 1 byte: DataType
+  /// 4 bytes: uint32_t num rows (fixed format)
+  ///   OR 1-5 bytes: varint num rows (when useVarintRowCount option is set)
   static constexpr int kEncodingTypeOffset = 0;
   static constexpr int kDataTypeOffset = 1;
   static constexpr int kRowCountOffset = 2;
   static constexpr int kPrefixSize = 6;
 
-  Encoding(velox::memory::MemoryPool& pool, std::string_view data);
+  Encoding(
+      velox::memory::MemoryPool& pool,
+      std::string_view data,
+      const Options& options = {});
   virtual ~Encoding() = default;
 
   EncodingType encodingType() const {
@@ -119,6 +132,12 @@ class Encoding {
 
   uint32_t rowCount() const {
     return rowCount_;
+  }
+
+  /// Returns the byte offset where encoding-specific data begins, right after
+  /// the common prefix (EncodingType + DataType + rowCount).
+  uint32_t dataOffset() const {
+    return prefixSize_;
   }
 
   static void copyIOBuf(char* pos, const folly::IOBuf& buf);
@@ -134,6 +153,11 @@ class Encoding {
   // iterator; if you need to move your row pointer back, reset() and skip().
   virtual void skip(uint32_t rowCount) = 0;
 
+  /// Seeks to the position at or after the given value.
+  ///
+  /// @param value Pointer to target value to seek.
+  /// @return Row index if found, std::nullopt if value is greater than all
+  /// entries.
   virtual std::optional<uint32_t> seekAtOrAfter(const void* value) {
     NIMBLE_UNSUPPORTED("seekAtOrAfter is not supported.");
   }
@@ -175,7 +199,7 @@ class Encoding {
       uint32_t rowCount,
       void* buffer,
       std::function<void*()> nulls,
-      const bits::Bitmap* scatterBitmap = nullptr,
+      const velox::bits::Bitmap* scatterBitmap = nullptr,
       uint32_t offset = 0) = 0;
 
   // Read bool values to output buffer as bits.
@@ -229,16 +253,27 @@ class Encoding {
 
  protected:
   static void serializePrefix(
-      EncodingType encodingType,
-      DataType dataType,
-      uint32_t rowCount,
-      char*& pos);
+    EncodingType encodingType,
+    DataType dataType,
+    uint32_t rowCount,
+    bool useVarint,
+    char*& pos);
+
+  // Compute the prefix size for serialization. Returns kPrefixSize for fixed
+  // format, or 2 + varintSize(rowCount) for varint format.
+  static uint32_t serializePrefixSize(uint32_t rowCount, bool useVarint);
+  // Static helpers for initializer list computation.
+  static DataType readDataType(std::string_view data);
+  static uint32_t readRowCount(std::string_view data, bool useVarint);
+  static uint32_t readPrefixSize(std::string_view data, bool useVarint);
 
   velox::memory::MemoryPool* const pool_;
   const std::string_view data_;
   const EncodingType encodingType_;
+  const Options options_;
   const DataType dataType_;
   const uint32_t rowCount_;
+  const uint32_t prefixSize_;
 };
 
 // The TypedEncoding<physicalType> class exposes the same interface as the base
@@ -251,8 +286,11 @@ class TypedEncoding : public Encoding {
       std::is_same_v<physicalType, typename TypeTraits<T>::physicalType>);
 
  public:
-  TypedEncoding(velox::memory::MemoryPool& memoryPool, std::string_view data)
-      : Encoding{memoryPool, data} {}
+  TypedEncoding(
+      velox::memory::MemoryPool& memoryPool,
+      std::string_view data,
+      const Options& options = {})
+      : Encoding{memoryPool, data, options} {}
 
   // Similar to materialize(), but scatters values to output buffer according to
   // scatterBitmap. When scatterBitmap is nullptr or all 1's, the output
@@ -262,7 +300,7 @@ class TypedEncoding : public Encoding {
       uint32_t rowCount,
       void* buffer,
       std::function<void*()> nulls,
-      const bits::Bitmap* scatterBitmap,
+      const velox::bits::Bitmap* scatterBitmap,
       uint32_t offset) override {
     // 1. Read X items from the encoding.
     // 2. Spread the items read in #1 into positions in |buffer| where
@@ -286,7 +324,7 @@ class TypedEncoding : public Encoding {
 
     void* nullBitmap = nulls();
 
-    bits::BitmapBuilder nullBits{nullBitmap, offset + scatterCount};
+    velox::bits::BitmapBuilder nullBits{nullBitmap, offset + scatterCount};
     nullBits.copy(*scatterBitmap, offset, offset + scatterCount);
 
     // Scatter backward

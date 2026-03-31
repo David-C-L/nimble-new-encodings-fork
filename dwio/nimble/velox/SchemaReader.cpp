@@ -265,6 +265,14 @@ const std::string& RowType::nameAt(size_t index) const {
   return names_[index];
 }
 
+std::optional<size_t> RowType::findChild(std::string_view name) const {
+  const auto it = std::find(names_.begin(), names_.end(), name);
+  if (it == names_.end()) {
+    return std::nullopt;
+  }
+  return it - names_.begin();
+}
+
 FlatMapType::FlatMapType(
     StreamDescriptor nullsDescriptor,
     ScalarKind keyScalarKind,
@@ -311,6 +319,14 @@ const std::shared_ptr<const Type>& FlatMapType::childAt(size_t index) const {
 const std::string& FlatMapType::nameAt(size_t index) const {
   NIMBLE_CHECK_LT(index, names_.size(), "Index out of range.");
   return names_[index];
+}
+
+std::optional<size_t> FlatMapType::findChild(std::string_view name) const {
+  const auto it = std::find(names_.begin(), names_.end(), name);
+  if (it == names_.end()) {
+    return std::nullopt;
+  }
+  return it - names_.begin();
 }
 
 ArrayWithOffsetsType::ArrayWithOffsetsType(
@@ -464,7 +480,7 @@ NamedType getType(offset_size& index, const std::vector<SchemaNode>& nodes) {
 
 std::shared_ptr<const Type> SchemaReader::getSchema(
     const std::vector<SchemaNode>& nodes) {
-  offset_size index = 0;
+  offset_size index{0};
   auto namedType = getType(index, nodes);
   return namedType.type;
 }
@@ -628,6 +644,47 @@ std::ostream& operator<<(
         }
       });
   return out;
+}
+
+bool hasValueStreams(
+    const Type& type,
+    const std::function<bool(offset_size)>& hasStream) {
+  switch (type.kind()) {
+    case Kind::Scalar:
+      return hasStream(type.asScalar().scalarDescriptor().offset());
+    case Kind::TimestampMicroNano:
+      return hasStream(type.asTimestampMicroNano().microsDescriptor().offset());
+    case Kind::Array:
+      return hasStream(type.asArray().lengthsDescriptor().offset());
+    case Kind::ArrayWithOffsets:
+      return hasStream(type.asArrayWithOffsets().offsetsDescriptor().offset());
+    case Kind::Map:
+      return hasStream(type.asMap().lengthsDescriptor().offset());
+    case Kind::SlidingWindowMap:
+      return hasStream(type.asSlidingWindowMap().offsetsDescriptor().offset());
+    case Kind::Row:
+      // Null stream can be omitted when all non-null. Check first child.
+      NIMBLE_CHECK_GT(
+          type.asRow().childrenCount(),
+          0,
+          "Row type must have at least one child");
+      return hasValueStreams(*type.asRow().childAt(0), hasStream);
+    case Kind::FlatMap: {
+      // FlatMap children are independent keys — iterate all children.
+      NIMBLE_CHECK_GT(
+          type.asFlatMap().childrenCount(),
+          0,
+          "FlatMap type must have at least one child");
+      for (size_t i = 0; i < type.asFlatMap().childrenCount(); ++i) {
+        if (hasValueStreams(*type.asFlatMap().childAt(i), hasStream)) {
+          return true;
+        }
+      }
+      return false;
+    }
+    default:
+      NIMBLE_UNREACHABLE("Unsupported type kind: {}", type.kind());
+  }
 }
 
 } // namespace facebook::nimble
