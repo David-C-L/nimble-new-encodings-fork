@@ -21,6 +21,8 @@
 #include "dwio/nimble/encodings/EncodingFactory.h"
 #include "dwio/nimble/encodings/EncodingSelectionPolicy.h"
 #include "dwio/nimble/encodings/FixedBitWidthEncoding.h"
+#include "dwio/nimble/encodings/ForEncoding.h"
+#include "dwio/nimble/encodings/FrequencyPartitionEncoding.h"
 #include "dwio/nimble/encodings/MainlyConstantEncoding.h"
 #include "dwio/nimble/encodings/NullableEncoding.h"
 #include "dwio/nimble/encodings/RleEncoding.h"
@@ -29,6 +31,80 @@
 #include "dwio/nimble/encodings/VarintEncoding.h"
 
 namespace facebook::nimble::test {
+
+// Forward declaration of Encoder
+template <typename E>
+class Encoder;
+
+// EncodingTypeTraits must be defined at namespace scope
+template <typename E, typename T>
+struct EncodingTypeTraits {};
+
+template <typename T>
+struct EncodingTypeTraits<nimble::ConstantEncoding<T>, T> {
+  static constexpr inline nimble::EncodingType encodingType =
+      nimble::EncodingType::Constant;
+};
+
+template <typename T>
+struct EncodingTypeTraits<nimble::DictionaryEncoding<T>, T> {
+  static constexpr inline nimble::EncodingType encodingType =
+      nimble::EncodingType::Dictionary;
+};
+
+template <typename T>
+struct EncodingTypeTraits<nimble::FixedBitWidthEncoding<T>, T> {
+  static constexpr inline nimble::EncodingType encodingType =
+      nimble::EncodingType::FixedBitWidth;
+};
+
+template <typename T>
+struct EncodingTypeTraits<nimble::FrequencyPartitionEncoding<T>, T> {
+  static constexpr inline nimble::EncodingType encodingType =
+      nimble::EncodingType::FrequencyPartition;
+};
+
+template <typename T>
+struct EncodingTypeTraits<nimble::ForEncoding<T>, T> {
+  static constexpr inline nimble::EncodingType encodingType =
+      nimble::EncodingType::FOR;
+};
+
+template <typename T>
+struct EncodingTypeTraits<nimble::MainlyConstantEncoding<T>, T> {
+  static constexpr inline nimble::EncodingType encodingType =
+      nimble::EncodingType::MainlyConstant;
+};
+
+template <typename T>
+struct EncodingTypeTraits<nimble::RLEEncoding<T>, T> {
+  static constexpr inline nimble::EncodingType encodingType =
+      nimble::EncodingType::RLE;
+};
+
+template <typename T>
+struct EncodingTypeTraits<nimble::SparseBoolEncoding, T> {
+  static constexpr inline nimble::EncodingType encodingType =
+      nimble::EncodingType::SparseBool;
+};
+
+template <typename T>
+struct EncodingTypeTraits<nimble::TrivialEncoding<T>, T> {
+  static constexpr inline nimble::EncodingType encodingType =
+      nimble::EncodingType::Trivial;
+};
+
+template <typename T>
+struct EncodingTypeTraits<nimble::VarintEncoding<T>, T> {
+  static constexpr inline nimble::EncodingType encodingType =
+      nimble::EncodingType::Varint;
+};
+
+template <typename T>
+struct EncodingTypeTraits<nimble::NullableEncoding<T>, T> {
+  static constexpr inline nimble::EncodingType encodingType =
+      nimble::EncodingType::Nullable;
+};
 
 template <typename E>
 class Encoder {
@@ -110,66 +186,9 @@ class Encoder {
     CompressionType compressionType_;
   };
 
-  template <typename Encoding>
-  struct EncodingTypeTraits {};
-
-  template <>
-  struct EncodingTypeTraits<nimble::ConstantEncoding<T>> {
-    static constexpr inline nimble::EncodingType encodingType =
-        nimble::EncodingType::Constant;
-  };
-
-  template <>
-  struct EncodingTypeTraits<nimble::DictionaryEncoding<T>> {
-    static constexpr inline nimble::EncodingType encodingType =
-        nimble::EncodingType::Dictionary;
-  };
-
-  template <>
-  struct EncodingTypeTraits<nimble::FixedBitWidthEncoding<T>> {
-    static constexpr inline nimble::EncodingType encodingType =
-        nimble::EncodingType::FixedBitWidth;
-  };
-
-  template <>
-  struct EncodingTypeTraits<nimble::MainlyConstantEncoding<T>> {
-    static constexpr inline nimble::EncodingType encodingType =
-        nimble::EncodingType::MainlyConstant;
-  };
-
-  template <>
-  struct EncodingTypeTraits<nimble::RLEEncoding<T>> {
-    static constexpr inline nimble::EncodingType encodingType =
-        nimble::EncodingType::RLE;
-  };
-
-  template <>
-  struct EncodingTypeTraits<nimble::SparseBoolEncoding> {
-    static constexpr inline nimble::EncodingType encodingType =
-        nimble::EncodingType::SparseBool;
-  };
-
-  template <>
-  struct EncodingTypeTraits<nimble::TrivialEncoding<T>> {
-    static constexpr inline nimble::EncodingType encodingType =
-        nimble::EncodingType::Trivial;
-  };
-
-  template <>
-  struct EncodingTypeTraits<nimble::VarintEncoding<T>> {
-    static constexpr inline nimble::EncodingType encodingType =
-        nimble::EncodingType::Varint;
-  };
-
-  template <>
-  struct EncodingTypeTraits<nimble::NullableEncoding<T>> {
-    static constexpr inline nimble::EncodingType encodingType =
-        nimble::EncodingType::Nullable;
-  };
-
  public:
   static constexpr EncodingType encodingType() {
-    return EncodingTypeTraits<E>::encodingType;
+    return EncodingTypeTraits<E, T>::encodingType;
   }
 
   static std::string_view encode(
@@ -182,7 +201,7 @@ class Encoder {
     auto physicalValues = std::span<const physicalType>(
         reinterpret_cast<const physicalType*>(values.data()), values.size());
     nimble::EncodingSelection<physicalType> selection{
-        {.encodingType = EncodingTypeTraits<E>::encodingType,
+        {.encodingType = EncodingTypeTraits<E, T>::encodingType,
          .compressionPolicyFactory =
              [compressionType]() {
                return std::make_unique<TestCompressPolicy>(compressionType);
@@ -206,7 +225,7 @@ class Encoder {
     auto physicalValues = std::span<const physicalType>(
         reinterpret_cast<const physicalType*>(values.data()), values.size());
     nimble::EncodingSelection<physicalType> selection{
-        {.encodingType = EncodingTypeTraits<E>::encodingType,
+        {.encodingType = EncodingTypeTraits<E, T>::encodingType,
          .compressionPolicyFactory =
              [compressionType]() {
                return std::make_unique<TestCompressPolicy>(compressionType);
