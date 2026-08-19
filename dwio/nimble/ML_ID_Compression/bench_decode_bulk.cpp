@@ -26,6 +26,7 @@
 #include <gflags/gflags.h>
 
 #include "dwio/nimble/ML_ID_Compression/BenchCommon.h"
+#include "dwio/nimble/ML_ID_Compression/OpenZLBenchTarget.h"
 #include "dwio/nimble/ML_ID_Compression/CachePolicy.h"
 #include "dwio/nimble/ML_ID_Compression/MeasureLoop.h"
 
@@ -60,6 +61,7 @@ int main(int argc, char** argv) {
   }
 
   auto encoders = buildDefaultEncoders<Elem>();
+  encoders.push_back(buildOpenZLEncoder<Elem>());
   auto datasets = defaultInt64Datasets<Elem>();
 
   const CacheTopology topo = CacheTopology::detect();
